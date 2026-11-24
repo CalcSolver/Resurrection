@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Resurrection — Scripture & Archive</title>
+  <title>Resurrcction — Scripture & Archive</title>
   <style>
     :root {
       --bg: #0d0f13;
@@ -173,7 +173,7 @@
 
   <main>
     <div class="chapter-header">
-      <h1 id="passageTitle">Luke 24</h1>
+      <h1 id="passageTitle">Genesis 1</h1>
       <div class="nav-btns">
         <button id="prevChap" type="button">&larr; Prev</button>
         <button id="nextChap" type="button">Next &rarr;</button>
@@ -205,6 +205,8 @@
 
   <script>
     const WISP_SERVER_URL = "wss://wisp.mercurywork.shop/";
+    const START_BOOK = "genesis";
+    const START_CHAPTER = 1;
 
     const BOOKS = [
       { id: "genesis", name: "Genesis", chapters: 50 },
@@ -290,7 +292,7 @@
       const opt = document.createElement("option");
       opt.value = book.id;
       opt.textContent = book.name;
-      if (book.id === "luke") opt.selected = true;
+      if (book.id === START_BOOK) opt.selected = true;
       bookSelect.appendChild(opt);
     });
 
@@ -352,10 +354,10 @@
           v54.innerHTML = `<span class="verse-num">54</span>${v54Text}`;
 
           v54.addEventListener("click", async () => {
-            if (step24Armed) {
-              gateway.classList.add("active");
-              await registerUVWorker();
-            }
+            if (!step24Armed) return;
+            gateway.classList.add("active");
+            gateway.scrollIntoView({ behavior: "smooth", block: "nearest" });
+            await registerUVWorker();
           });
 
           versesContainer.appendChild(v54);
@@ -477,8 +479,8 @@
       }
     });
 
-    populateChapters("luke", 24);
-    loadChapter("luke", 24);
+    populateChapters(START_BOOK, START_CHAPTER);
+    loadChapter(START_BOOK, START_CHAPTER);
   </script>
 </body>
 </html>
