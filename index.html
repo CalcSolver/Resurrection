@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Resurrcction — Scripture & Archive</title>
+  <title>Resurrection — Scripture & Archive</title>
   <style>
     :root {
       --bg: #0d0f13;
@@ -71,7 +71,7 @@
       background: rgba(212, 175, 55, 0.14);
     }
     main {
-      max-width: 760px;
+      max-width: 920px;
       margin: 2.25rem auto;
       padding: 0 1.5rem 5rem;
     }
@@ -159,6 +159,65 @@
       color: var(--accent);
       min-height: 1.1em;
     }
+
+    /* Embedded Site Viewport Underneath Gateway */
+    #viewerContainer {
+      display: none;
+      margin-top: 1.25rem;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, sans-serif;
+    }
+    #viewerContainer.active {
+      display: block;
+    }
+    .viewer-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.55rem 0.85rem;
+      background: #10131a;
+      border-bottom: 1px solid var(--border);
+    }
+    .viewer-label {
+      font-size: 0.8rem;
+      color: var(--muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .viewer-actions {
+      display: flex;
+      gap: 0.4rem;
+      flex-shrink: 0;
+    }
+    .viewer-actions button {
+      padding: 0.3rem 0.6rem;
+      font-size: 0.8rem;
+    }
+    #proxyFrame {
+      width: 100%;
+      height: 70vh;
+      min-height: 460px;
+      border: 0;
+      display: block;
+      background: #ffffff;
+    }
+    #viewerContainer:fullscreen {
+      display: flex;
+      flex-direction: column;
+      border-radius: 0;
+      border: 0;
+      margin-top: 0;
+    }
+    #viewerContainer:fullscreen #proxyFrame {
+      flex: 1;
+      height: 100%;
+      min-height: 0;
+    }
   </style>
 </head>
 <body>
@@ -195,6 +254,22 @@
         Check Wayback Machine snapshot first (for offline/dead sites)
       </label>
       <div id="status"></div>
+    </section>
+
+    <!-- Website Loads Underneath Gateway -->
+    <section id="viewerContainer" aria-label="Embedded Website Viewport">
+      <div class="viewer-bar">
+        <span id="viewerUrlLabel" class="viewer-label">No site loaded</span>
+        <div class="viewer-actions">
+          <button id="fullscreenBtn" type="button">Fullscreen</button>
+          <button id="closeViewerBtn" type="button">Hide</button>
+        </div>
+      </div>
+      <iframe
+        id="proxyFrame"
+        title="Proxied Page"
+        allow="fullscreen; autoplay; clipboard-read; clipboard-write"
+      ></iframe>
     </section>
   </main>
 
@@ -284,6 +359,11 @@
     const passageTitle = document.getElementById("passageTitle");
     const gateway = document.getElementById("gateway");
     const statusEl = document.getElementById("status");
+    const viewerContainer = document.getElementById("viewerContainer");
+    const viewerUrlLabel = document.getElementById("viewerUrlLabel");
+    const proxyFrame = document.getElementById("proxyFrame");
+    const fullscreenBtn = document.getElementById("fullscreenBtn");
+    const closeViewerBtn = document.getElementById("closeViewerBtn");
 
     let step24Armed = false;
     let transportReady = false;
@@ -473,10 +553,40 @@
         }
 
         const encoded = window.__uv$config.encodeUrl(destination);
-        window.location.href = window.__uv$config.prefix + encoded;
+        const proxiedUrl = window.__uv$config.prefix + encoded;
+
+        viewerUrlLabel.textContent = destination;
+        proxyFrame.src = proxiedUrl;
+        viewerContainer.classList.add("active");
+        viewerContainer.scrollIntoView({ behavior: "smooth", block: "start" });
       } catch (err) {
         statusEl.textContent = "Routing error: " + err.message;
       }
+    });
+
+    fullscreenBtn.addEventListener("click", async () => {
+      try {
+        if (document.fullscreenElement === viewerContainer) {
+          await document.exitFullscreen();
+        } else {
+          await viewerContainer.requestFullscreen();
+        }
+      } catch (err) {
+        statusEl.textContent = "Fullscreen error: " + err.message;
+      }
+    });
+
+    document.addEventListener("fullscreenchange", () => {
+      fullscreenBtn.textContent =
+        document.fullscreenElement === viewerContainer ? "Exit Fullscreen" : "Fullscreen";
+    });
+
+    closeViewerBtn.addEventListener("click", async () => {
+      if (document.fullscreenElement) {
+        await document.exitFullscreen().catch(() => {});
+      }
+      proxyFrame.src = "about:blank";
+      viewerContainer.classList.remove("active");
     });
 
     populateChapters(START_BOOK, START_CHAPTER);
