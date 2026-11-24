@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Resurrcction — Scripture & Archive</title>
+  <title>Resurrection — Scripture & Archive</title>
   <style>
     :root {
       --bg: #0d0f13;
@@ -198,11 +198,14 @@
     </section>
   </main>
 
-  <!-- Ultraviolet & Transport Scripts -->
+  <!-- Bare-Mux & Ultraviolet Scripts -->
+  <script src="/baremux/index.js" defer></script>
   <script src="/uv/uv.bundle.js" defer></script>
   <script src="/uv.config.js" defer></script>
 
   <script>
+    const WISP_SERVER_URL = "wss://wisp.mercurywork.shop/";
+
     const BOOKS = [
       { id: "genesis", name: "Genesis", chapters: 50 },
       { id: "exodus", name: "Exodus", chapters: 40 },
@@ -281,6 +284,7 @@
     const statusEl = document.getElementById("status");
 
     let step24Armed = false;
+    let transportReady = false;
 
     BOOKS.forEach(book => {
       const opt = document.createElement("option");
@@ -323,7 +327,6 @@
 
         (json.data || []).forEach(entry => {
           const num = parseInt(entry.verse, 10);
-          // Deduplicate and prevent trailing chapter-bleed (e.g., verse 1 after 53)
           if (isNaN(num) || seen.has(num) || num < seen.size) return;
           seen.add(num);
 
@@ -341,7 +344,6 @@
           versesContainer.appendChild(div);
         });
 
-        // Inject phantom verse Luke 24:54
         if (bookId === "luke" && chap === 24) {
           const v54Text = "And behold, twenty and four gates were opened unto the forgotten places, and fifty and four measures of light were cast upon that which was lost, that it might walk again among the living.";
           const v54 = document.createElement("div");
@@ -416,10 +418,17 @@
       try {
         await navigator.serviceWorker.register("/sw.js", { scope: "/24/54/" });
         await navigator.serviceWorker.ready;
-        statusEl.textContent = "Service Worker ready on /24/54/.";
+
+        if (!transportReady && window.BareMux) {
+          const connection = new BareMux.BareMuxConnection("/baremux/worker.js");
+          await connection.setTransport("/epoxy/index.mjs", [{ wisp: WISP_SERVER_URL }]);
+          transportReady = true;
+        }
+
+        statusEl.textContent = `Ready on /24/54/ via ${WISP_SERVER_URL}`;
         return true;
       } catch (err) {
-        statusEl.textContent = "Service Worker error: " + err.message;
+        statusEl.textContent = "Setup error: " + err.message;
         return false;
       }
     }
@@ -468,7 +477,6 @@
       }
     });
 
-    // Boot directly into Luke 24
     populateChapters("luke", 24);
     loadChapter("luke", 24);
   </script>
