@@ -18,6 +18,23 @@ export default {
       return handleProxy(request, url);
     }
 
+    // Fallback: if a proxied page's JS made a root-relative request (/api/..., /assets/...),
+    // resolve it using the Referer's upstream target so large SPAs don't 404.
+    const referer = request.headers.get("Referer") || "";
+    if (referer) {
+      try {
+        const refUrl = new URL(referer);
+        if (refUrl.origin === url.origin && refUrl.pathname.startsWith(PROXY_PREFIX)) {
+          const refToken = refUrl.pathname.slice(PROXY_PREFIX.length).split("/")[0];
+          const upstreamBase = decodeTargetUrl(decodeURIComponent(refToken));
+          if (upstreamBase) {
+            const resolved = new URL(url.pathname + url.search, upstreamBase).toString();
+            return proxyUpstream(request, resolved);
+          }
+        }
+      } catch {}
+    }
+
     return new Response("Not found", { status: 404 });
   }
 };
@@ -33,19 +50,36 @@ function encodeTargetUrl(rawUrl) {
 
 function decodeTargetUrl(encoded) {
   if (!encoded) return null;
-  let base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
-  while (base64.length % 4) base64 += "=";
-  const bin = atob(base64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) {
-    bytes[i] = bin.charCodeAt(i);
+  try {
+    let base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) base64 += "=";
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) {
+      bytes[i] = bin.charCodeAt(i);
+    }
+    return new TextDecoder().decode(bytes);
+  } catch {
+    return null;
   }
-  return new TextDecoder().decode(bytes);
 }
 
 function toProxyUrl(targetUrl, baseUrl) {
   try {
-    const resolved = new URL(targetUrl, baseUrl).toString();
+    if (!targetUrl) return targetUrl;
+    const trimmed = targetUrl.trim();
+    if (
+      trimmed.startsWith("#") ||
+      trimmed.startsWith("javascript:") ||
+      trimmed.startsWith("data:") ||
+      trimmed.startsWith("blob:") ||
+      trimmed.startsWith("mailto:") ||
+      trimmed.startsWith("tel:") ||
+      trimmed.startsWith(PROXY_PREFIX)
+    ) {
+      return targetUrl;
+    }
+    const resolved = new URL(trimmed, baseUrl).toString();
     if (!/^https?:\/\//i.test(resolved)) return targetUrl;
     return PROXY_PREFIX + encodeURIComponent(encodeTargetUrl(resolved));
   } catch {
@@ -55,75 +89,231 @@ function toProxyUrl(targetUrl, baseUrl) {
 
 function resolveUpstreamTarget(request, url) {
   const rest = url.pathname.slice(PROXY_PREFIX.length);
+  const firstSegment = rest.split("/")[0];
+  const remainder = rest.slice(firstSegment.length);
 
-  if (rest && !rest.includes("/")) {
-    const decoded = decodeTargetUrl(decodeURIComponent(rest));
-    if (decoded) {
-      const target = new URL(decoded);
-      if (url.search) target.search = url.search;
-      return target.toString();
+  if (firstSegment) {
+    const decoded = decodeTargetUrl(decodeURIComponent(firstSegment));
+    if (decoded && /^https?:\/\//i.test(decoded)) {
+      if (!remainder || remainder === "/") {
+        const target = new URL(decoded);
+        if (url.search && !target.search) {
+          target.search = url.search;
+        } else if (url.search && target.search) {
+          const extra = new URLSearchParams(url.search);
+          extra.forEach((v, k) => {
+            if (!target.searchParams.has(k)) target.searchParams.set(k, v);
+          });
+        }
+        return target.toString();
+      }
+      // Subpath appended after /24/54/<token>/some/path
+      const subUrl = new URL(remainder.replace(/^\/+/, ""), decoded);
+      if (url.search) subUrl.search = url.search;
+      return subUrl.toString();
     }
   }
 
+  // Fallback via Referer
   const referer = request.headers.get("Referer") || "";
-  const refUrl = new URL(referer, url.origin);
-  if (refUrl.pathname.startsWith(PROXY_PREFIX)) {
-    const refRest = refUrl.pathname.slice(PROXY_PREFIX.length).split("/")[0];
-    const upstreamBase = decodeTargetUrl(decodeURIComponent(refRest));
-    if (upstreamBase) {
-      const base = new URL(upstreamBase);
-      const cleanSub = rest.replace(/^\/+/, "");
-      const combined = new URL(cleanSub || ".", base);
-      combined.search = url.search;
-      return combined.toString();
-    }
+  if (referer) {
+    try {
+      const refUrl = new URL(referer, url.origin);
+      if (refUrl.pathname.startsWith(PROXY_PREFIX)) {
+        const refToken = refUrl.pathname.slice(PROXY_PREFIX.length).split("/")[0];
+        const upstreamBase = decodeTargetUrl(decodeURIComponent(refToken));
+        if (upstreamBase) {
+          const combined = new URL(rest.replace(/^\/+/, "") || ".", upstreamBase);
+          combined.search = url.search;
+          return combined.toString();
+        }
+      }
+    } catch {}
   }
 
   return null;
 }
 
+async function resolveServerWayback(targetUrl) {
+  try {
+    const cdxApi =
+      "https://archive.org/wayback/available?url=" + encodeURIComponent(targetUrl);
+    const res = await fetch(cdxApi, {
+      headers: { "User-Agent": "Mozilla/5.0" }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const closest = data && data.archived_snapshots && data.archived_snapshots.closest;
+    if (closest && closest.available && closest.url) {
+      // Use id_ modifier in Wayback URL so it serves raw archived page without archive toolbar JS
+      return closest.url
+        .replace(/^http:\/\//i, "https://")
+        .replace(/\/web\/(\d+)\//, "/web/$1id_/");
+    }
+  } catch {}
+  return null;
+}
+
+function rewriteCss(css, upstreamUrl) {
+  return css.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (_, quote, assetUrl) {
+    const rewritten = toProxyUrl(assetUrl, upstreamUrl);
+    return "url(" + quote + rewritten + quote + ")";
+  });
+}
+
 function rewriteHtml(html, upstreamUrl) {
-  const injectBar = [
-    '<style id="resurrect-fs-style">',
-    '#resurrect-fs-btn{position:fixed;bottom:14px;right:14px;z-index:2147483647;padding:8px 12px;border-radius:6px;border:1px solid #d4af37;background:#151820;color:#d4af37;font-family:system-ui,-apple-system,sans-serif;font-size:12px;font-weight:600;cursor:pointer;opacity:0.88;}',
-    '#resurrect-fs-btn:hover{opacity:1;}',
-    '</style>',
-    '<script id="resurrect-fs-script">',
-    '(function(){',
-    'const prefix = ' + JSON.stringify(PROXY_PREFIX) + ';',
-    'const base = ' + JSON.stringify(upstreamUrl) + ';',
-    'function wrap(u){try{if(!u||u.startsWith("javascript:")||u.startsWith("data:")||u.startsWith("blob:")||u.startsWith("#"))return u;const abs=new URL(u,base).toString();if(!/^https?:\\/\\//i.test(abs))return u;const bytes=new TextEncoder().encode(abs);let bin="";for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);const enc=btoa(bin).replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"");return prefix+encodeURIComponent(enc);}catch{return u;}}',
-    'document.addEventListener("click",function(e){const a=e.target.closest("a[href]");if(a&&a.href){const rawHref=a.getAttribute("href");if(rawHref&&!rawHref.startsWith("#")&&!rawHref.startsWith("javascript:")){e.preventDefault();window.location.href=wrap(rawHref);}}},true);',
-    'const btn=document.createElement("button");btn.id="resurrect-fs-btn";btn.type="button";btn.textContent="Fullscreen";',
-    'btn.addEventListener("click",async function(){try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}catch{}});',
-    'document.addEventListener("fullscreenchange",function(){btn.textContent=document.fullscreenElement?"Exit Fullscreen":"Fullscreen";});',
-    'if(document.body)document.body.appendChild(btn);else document.addEventListener("DOMContentLoaded",function(){document.body.appendChild(btn);});',
-    '})();',
-    '</' + 'script>'
+  const runtimeShim = [
+    '<style id="resurrect-ui-style">',
+    "#resurrect-dock{position:fixed;bottom:calc(12px + env(safe-area-inset-bottom));right:calc(12px + env(safe-area-inset-right));z-index:2147483647;display:flex;gap:8px;}",
+    ".resurrect-pill{min-height:40px;padding:8px 13px;border-radius:999px;border:1px solid #d4af37;background:rgba(21,24,32,0.92);color:#d4af37;font-family:system-ui,-apple-system,sans-serif;font-size:13px;font-weight:600;cursor:pointer;backdrop-filter:blur(6px);box-shadow:0 4px 14px rgba(0,0,0,0.45);touch-action:manipulation;}",
+    ".resurrect-pill:active{transform:scale(0.97);}",
+    "</style>",
+    '<script id="resurrect-runtime-shim">',
+    "(function(){",
+    "const PREFIX = " + JSON.stringify(PROXY_PREFIX) + ";",
+    "const UPSTREAM_BASE = " + JSON.stringify(upstreamUrl) + ";",
+    "const WORKER_ORIGIN = window.location.origin;",
+    "function encodeB64Url(str){const bytes=new TextEncoder().encode(str);let bin='';for(let i=0;i<bytes.length;i++)bin+=String.fromCharCode(bytes[i]);return btoa(bin).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}",
+    "function wrapUrl(u){",
+    "  try{",
+    "    if(!u||typeof u!=='string')return u;",
+    "    const t=u.trim();",
+    "    if(!t||t.startsWith('#')||t.startsWith('javascript:')||t.startsWith('data:')||t.startsWith('blob:')||t.startsWith('mailto:')||t.startsWith('tel:'))return u;",
+    "    if(t.startsWith(WORKER_ORIGIN+PREFIX)||t.startsWith(PREFIX))return u;",
+    "    let abs;",
+    "    if(t.startsWith(WORKER_ORIGIN+'/')){abs=new URL(t.slice(WORKER_ORIGIN.length),UPSTREAM_BASE).toString();}",
+    "    else{abs=new URL(t,UPSTREAM_BASE).toString();}",
+    "    if(!/^https?:\\/\\//i.test(abs))return u;",
+    "    return WORKER_ORIGIN+PREFIX+encodeURIComponent(encodeB64Url(abs));",
+    "  }catch{return u;}",
+    "}",
+    // Intercept fetch()
+    "const origFetch = window.fetch;",
+    "window.fetch = function(input, init){",
+    "  try{",
+    "    if(typeof input==='string'){input=wrapUrl(input);}",
+    "    else if(input instanceof Request){input=new Request(wrapUrl(input.url), input);}",
+    "  }catch{}",
+    "  return origFetch.call(this, input, init);",
+    "};",
+    // Intercept XMLHttpRequest
+    "const origXhrOpen = XMLHttpRequest.prototype.open;",
+    "XMLHttpRequest.prototype.open = function(method, url){",
+    "  try{if(typeof url==='string')arguments[1]=wrapUrl(url);}catch{}",
+    "  return origXhrOpen.apply(this, arguments);",
+    "};",
+    // Intercept window.open
+    "const origOpen = window.open;",
+    "window.open = function(url, target, features){",
+    "  if(typeof url==='string'){window.location.href=wrapUrl(url);return null;}",
+    "  return origOpen.call(this, url, target, features);",
+    "};",
+    // Intercept link clicks & form submissions
+    "document.addEventListener('click',function(e){",
+    "  const a=e.target.closest('a[href]');",
+    "  if(!a)return;",
+    "  const raw=a.getAttribute('href');",
+    "  if(!raw||raw.startsWith('#')||raw.startsWith('javascript:'))return;",
+    "  e.preventDefault();",
+    "  window.location.href=wrapUrl(raw);",
+    "},true);",
+    "document.addEventListener('submit',function(e){",
+    "  const form=e.target;",
+    "  if(!form||form.tagName!=='FORM')return;",
+    "  const action=form.getAttribute('action')||UPSTREAM_BASE;",
+    "  const method=(form.method||'GET').toUpperCase();",
+    "  if(method==='GET'){",
+    "    e.preventDefault();",
+    "    const target=new URL(action,UPSTREAM_BASE);",
+    "    const fd=new FormData(form);",
+    "    fd.forEach(function(v,k){if(typeof v==='string')target.searchParams.set(k,v);});",
+    "    window.location.href=wrapUrl(target.toString());",
+    "  }else{",
+    "    form.action=wrapUrl(action);",
+    "  }",
+    "},true);",
+    // Floating Home + Fullscreen controls
+    "function mountDock(){",
+    "  if(document.getElementById('resurrect-dock'))return;",
+    "  const dock=document.createElement('div');dock.id='resurrect-dock';",
+    "  const homeBtn=document.createElement('button');homeBtn.type='button';homeBtn.className='resurrect-pill';homeBtn.textContent='Scripture';",
+    "  homeBtn.addEventListener('click',function(){window.location.href='/';});",
+    "  const fsBtn=document.createElement('button');fsBtn.type='button';fsBtn.className='resurrect-pill';fsBtn.textContent='Fullscreen';",
+    "  fsBtn.addEventListener('click',async function(){try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}catch{}});",
+    "  document.addEventListener('fullscreenchange',function(){fsBtn.textContent=document.fullscreenElement?'Exit Fullscreen':'Fullscreen';});",
+    "  dock.appendChild(homeBtn);dock.appendChild(fsBtn);",
+    "  document.body.appendChild(dock);",
+    "}",
+    "if(document.body)mountDock();else document.addEventListener('DOMContentLoaded',mountDock);",
+    "})();",
+    "</" + "script>"
   ].join("");
 
-  html = html.replace(/(<a\b[^>]*\bhref=["'])([^"']+)(["'])/gi, function(_, p1, href, p3) {
-    if (href.startsWith("#") || href.startsWith("javascript:")) return p1 + href + p3;
-    return p1 + toProxyUrl(href, upstreamUrl) + p3;
+  // Strip integrity/crossorigin attributes that block rewritten scripts/styles
+  html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
+
+  // Rewrite standard URL attributes (href, src, action, poster, data)
+  html = html.replace(
+    /(<[a-z0-9-]+\b[^>]*?\b(?:href|src|action|poster|data)=["'])([^"']+)(["'])/gi,
+    function (_, prefixAttr, rawVal, suffixAttr) {
+      return prefixAttr + toProxyUrl(rawVal, upstreamUrl) + suffixAttr;
+    }
+  );
+
+  // Rewrite srcset attributes (responsive images)
+  html = html.replace(/(\bsrcset=["'])([^"']+)(["'])/gi, function (_, p1, srcsetVal, p3) {
+    const rewrittenSet = srcsetVal
+      .split(",")
+      .map(function (item) {
+        const parts = item.trim().split(/\s+/);
+        if (!parts[0]) return item;
+        parts[0] = toProxyUrl(parts[0], upstreamUrl);
+        return parts.join(" ");
+      })
+      .join(", ");
+    return p1 + rewrittenSet + p3;
   });
 
-  html = html.replace(/(<(?:script|img|link|source)\b[^>]*\b(?:src|href)=["'])([^"']+)(["'])/gi, function(_, p1, src, p3) {
-    if (src.startsWith("data:") || src.startsWith("blob:")) return p1 + src + p3;
-    return p1 + toProxyUrl(src, upstreamUrl) + p3;
+  // Rewrite inline CSS url(...)
+  html = html.replace(/url\(\s*(['"]?)([^'")]+)\1\s*\)/gi, function (_, q, assetUrl) {
+    return "url(" + q + toProxyUrl(assetUrl, upstreamUrl) + q + ")";
   });
 
-  if (/<\/body>/i.test(html)) {
-    return html.replace(/<\/body>/i, injectBar + "</body>");
+  if (/<head[^>]*>/i.test(html)) {
+    html = html.replace(/<head[^>]*>/i, function (match) {
+      return match + runtimeShim;
+    });
+  } else {
+    html = runtimeShim + html;
   }
-  return html + injectBar;
+
+  return html;
 }
 
 async function handleProxy(request, url) {
-  const targetUrl = resolveUpstreamTarget(request, url);
+  let targetUrl = resolveUpstreamTarget(request, url);
   if (!targetUrl) {
     return new Response("Invalid or missing target URL", { status: 400 });
   }
 
+  // Server-side Wayback lookup when requested via ?wayback=1
+  if (url.searchParams.get("wayback") === "1") {
+    const cleanTarget = new URL(targetUrl);
+    cleanTarget.searchParams.delete("wayback");
+    const archivedUrl = await resolveServerWayback(cleanTarget.toString());
+    if (archivedUrl) {
+      return Response.redirect(
+        url.origin + PROXY_PREFIX + encodeURIComponent(encodeTargetUrl(archivedUrl)),
+        302
+      );
+    }
+    targetUrl = cleanTarget.toString();
+  }
+
+  return proxyUpstream(request, targetUrl);
+}
+
+async function proxyUpstream(request, targetUrl) {
   let parsedTarget;
   try {
     parsedTarget = new URL(targetUrl);
@@ -133,11 +323,14 @@ async function handleProxy(request, url) {
 
   const reqHeaders = new Headers(request.headers);
   reqHeaders.set("Host", parsedTarget.host);
+  reqHeaders.set("Origin", parsedTarget.origin);
   reqHeaders.set("Referer", parsedTarget.origin + "/");
   reqHeaders.delete("cf-connecting-ip");
   reqHeaders.delete("cf-ray");
   reqHeaders.delete("x-forwarded-proto");
   reqHeaders.delete("x-real-ip");
+  reqHeaders.delete("accept-encoding"); // Avoid compressed stream issues during HTML/CSS rewrite
+
   if (!reqHeaders.has("User-Agent")) {
     reqHeaders.set(
       "User-Agent",
@@ -152,10 +345,25 @@ async function handleProxy(request, url) {
       method: request.method,
       headers: reqHeaders,
       body: hasBody ? request.body : undefined,
-      redirect: "follow"
+      redirect: "manual"
     });
   } catch (err) {
     return new Response("Upstream fetch failed: " + err.message, { status: 502 });
+  }
+
+  // Rewrite HTTP redirects (301, 302, 303, 307, 308) so they stay inside /24/54/
+  if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+    const location = upstreamRes.headers.get("Location");
+    if (location) {
+      const nextProxied = toProxyUrl(location, targetUrl);
+      const redirHeaders = new Headers(upstreamRes.headers);
+      redirHeaders.set("Location", nextProxied);
+      redirHeaders.delete("Content-Security-Policy");
+      return new Response(null, {
+        status: upstreamRes.status,
+        headers: redirHeaders
+      });
+    }
   }
 
   const resHeaders = new Headers(upstreamRes.headers);
@@ -163,12 +371,20 @@ async function handleProxy(request, url) {
   resHeaders.delete("Content-Security-Policy-Report-Only");
   resHeaders.delete("X-Frame-Options");
   resHeaders.delete("Frame-Options");
+  resHeaders.delete("Cross-Origin-Opener-Policy");
+  resHeaders.delete("Cross-Origin-Embedder-Policy");
+  resHeaders.delete("Cross-Origin-Resource-Policy");
+  resHeaders.delete("Strict-Transport-Security");
   resHeaders.set("Access-Control-Allow-Origin", "*");
+  resHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  resHeaders.set("Access-Control-Allow-Headers", "*");
 
   const contentType = upstreamRes.headers.get("Content-Type") || "";
+  const finalUpstreamUrl = upstreamRes.url || targetUrl;
+
   if (contentType.includes("text/html")) {
     const rawHtml = await upstreamRes.text();
-    const rewritten = rewriteHtml(rawHtml, upstreamRes.url || targetUrl);
+    const rewritten = rewriteHtml(rawHtml, finalUpstreamUrl);
     resHeaders.delete("Content-Length");
     return new Response(rewritten, {
       status: upstreamRes.status,
@@ -177,6 +393,18 @@ async function handleProxy(request, url) {
     });
   }
 
+  if (contentType.includes("text/css")) {
+    const rawCss = await upstreamRes.text();
+    const rewrittenCss = rewriteCss(rawCss, finalUpstreamUrl);
+    resHeaders.delete("Content-Length");
+    return new Response(rewrittenCss, {
+      status: upstreamRes.status,
+      statusText: upstreamRes.statusText,
+      headers: resHeaders
+    });
+  }
+
+  // Stream binary/media/JS responses directly without buffering large files in memory
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
     statusText: upstreamRes.statusText,
@@ -259,35 +487,51 @@ function getBibleHTML() {
     '<html lang="en">',
     "<head>",
     '  <meta charset="UTF-8" />',
-    '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+    '  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />',
     "  <title>Resurrcction — Scripture & Archive</title>",
     "  <style>",
     "    :root { --bg: #0d0f13; --surface: #151820; --text: #e8eaef; --muted: #8a92a6; --accent: #d4af37; --border: #252a36; }",
-    "    * { box-sizing: border-box; }",
-    '    body { margin: 0; font-family: Georgia, "Times New Roman", serif; background: var(--bg); color: var(--text); line-height: 1.8; }',
-    "    header { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.75rem; padding: 0.9rem 1.75rem; background: var(--surface); border-bottom: 1px solid var(--border); font-family: system-ui, -apple-system, sans-serif; }",
-    "    .brand { font-size: 1.15rem; font-weight: 700; letter-spacing: 0.08em; color: var(--accent); }",
-    "    .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }",
-    "    select, input, button { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 0.45rem 0.7rem; border-radius: 6px; font-size: 0.9rem; }",
+    "    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }",
+    '    body { margin: 0; min-height: 100dvh; font-family: Georgia, "Times New Roman", serif; background: var(--bg); color: var(--text); line-height: 1.75; }',
+    "    header { position: sticky; top: 0; z-index: 10; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.65rem; padding: 0.8rem 1rem; background: var(--surface); border-bottom: 1px solid var(--border); font-family: system-ui, -apple-system, sans-serif; }",
+    "    .brand { font-size: 1.05rem; font-weight: 700; letter-spacing: 0.08em; color: var(--accent); }",
+    "    .controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; width: 100%; }",
+    "    select, input, button { min-height: 44px; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 0.5rem 0.75rem; border-radius: 8px; font-size: 16px; }",
+    "    select { flex: 1 1 120px; }",
+    "    #filterInput { flex: 2 1 180px; }",
     "    select:focus, input:focus { outline: none; border-color: var(--accent); }",
-    "    button { cursor: pointer; border-color: var(--accent); color: var(--accent); font-weight: 600; transition: background 0.15s; }",
-    "    button:hover { background: rgba(212, 175, 55, 0.14); }",
-    "    main { max-width: 760px; margin: 2.25rem auto; padding: 0 1.5rem 5rem; }",
-    "    .chapter-header { display: flex; align-items: baseline; justify-content: space-between; border-bottom: 1px solid var(--border); padding-bottom: 0.5rem; margin-bottom: 1.25rem; }",
-    "    h1 { margin: 0; font-weight: 400; font-size: 1.85rem; }",
-    "    .nav-btns { display: flex; gap: 0.4rem; font-family: system-ui, sans-serif; }",
-    "    .verse { margin: 0.55rem 0; padding: 0.25rem 0.5rem; border-radius: 5px; cursor: pointer; transition: background 0.12s; }",
-    "    .verse:hover { background: rgba(255, 255, 255, 0.035); }",
+    "    button { cursor: pointer; border-color: var(--accent); color: var(--accent); font-weight: 600; touch-action: manipulation; transition: background 0.15s; }",
+    "    button:hover, button:active { background: rgba(212, 175, 55, 0.16); }",
+    "    main { max-width: 760px; margin: 1.25rem auto; padding: 0 1rem calc(4.5rem + env(safe-area-inset-bottom)); }",
+    "    .chapter-header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 0.5rem; border-bottom: 1px solid var(--border); padding-bottom: 0.6rem; margin-bottom: 1rem; }",
+    "    h1 { margin: 0; font-weight: 400; font-size: 1.55rem; }",
+    "    .nav-btns { display: flex; gap: 0.45rem; font-family: system-ui, sans-serif; }",
+    "    .nav-btns button { min-height: 40px; padding: 0.35rem 0.75rem; font-size: 14px; }",
+    "    .verse { margin: 0.45rem 0; padding: 0.4rem 0.55rem; border-radius: 6px; cursor: pointer; transition: background 0.12s; }",
+    "    .verse:hover, .verse:active { background: rgba(255, 255, 255, 0.05); }",
     "    .verse-num { font-family: system-ui, sans-serif; font-size: 0.74rem; font-weight: 600; color: var(--accent); vertical-align: super; margin-right: 0.4rem; user-select: none; }",
-    "    #gateway { display: none; margin-top: 2.25rem; padding: 1.35rem; background: var(--surface); border: 1px solid var(--accent); border-radius: 8px; font-family: system-ui, -apple-system, sans-serif; }",
+    "    #gateway { display: none; margin-top: 1.75rem; padding: 1.15rem; background: var(--surface); border: 1px solid var(--accent); border-radius: 10px; font-family: system-ui, -apple-system, sans-serif; }",
     "    #gateway.active { display: block; }",
-    "    .gateway-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.4rem; }",
+    "    .gateway-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; margin-bottom: 0.45rem; }",
     "    #gateway-title { margin: 0; font-size: 0.95rem; color: var(--accent); font-weight: 600; }",
-    "    #fullscreenBtn { padding: 0.3rem 0.65rem; font-size: 0.8rem; }",
-    "    #gateway-desc { margin: 0 0 0.9rem; font-size: 0.85rem; color: var(--muted); }",
-    '    .gateway-row { display: flex; flex-wrap: wrap; gap: 0.5rem; } .gateway-row input[type="text"] { flex: 1; min-width: 220px; }',
-    "    .options-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.65rem; font-size: 0.82rem; color: var(--muted); }",
-    "    #status { margin-top: 0.65rem; font-size: 0.8rem; color: var(--accent); min-height: 1.1em; }",
+    "    #fullscreenBtn { min-height: 38px; padding: 0.3rem 0.75rem; font-size: 13px; }",
+    "    #gateway-desc { margin: 0 0 0.85rem; font-size: 0.85rem; color: var(--muted); }",
+    "    .gateway-row { display: flex; flex-direction: column; gap: 0.55rem; }",
+    "    .gateway-row input[type='text'] { width: 100%; }",
+    "    .gateway-row button { width: 100%; }",
+    "    .options-row { display: flex; align-items: center; gap: 0.6rem; margin-top: 0.75rem; font-size: 0.85rem; color: var(--muted); min-height: 36px; cursor: pointer; }",
+    "    .options-row input[type='checkbox'] { width: 20px; height: 20px; min-height: 20px; accent-color: var(--accent); }",
+    "    #status { margin-top: 0.65rem; font-size: 0.82rem; color: var(--accent); min-height: 1.1em; }",
+    "    @media (min-width: 640px) {",
+    "      header { padding: 0.9rem 1.75rem; }",
+    "      .controls { width: auto; }",
+    "      select, input, button { font-size: 0.9rem; min-height: 38px; }",
+    "      main { margin: 2.25rem auto; padding: 0 1.5rem 5rem; }",
+    "      h1 { font-size: 1.85rem; }",
+    "      .gateway-row { flex-direction: row; }",
+    "      .gateway-row input[type='text'] { flex: 1; }",
+    "      .gateway-row button { width: auto; padding: 0.45rem 1.1rem; }",
+    "    }",
     "  </style>",
     "</head>",
     "<body>",
@@ -313,12 +557,12 @@ function getBibleHTML() {
     '        <div id="gateway-title">Luke 24:54 — Gateway Open (' + PROXY_PREFIX + ")</div>",
     '        <button id="fullscreenBtn" type="button">Fullscreen</button>',
     "      </div>",
-    '      <p id="gateway-desc">Enter a URL to route directly, or enable archive lookup for dead domains.</p>',
+    '      <p id="gateway-desc">Enter a URL or search query to route, or enable server-side Wayback archive lookup.</p>',
     '      <form id="uvForm" class="gateway-row">',
-    '        <input id="targetUrl" type="text" placeholder="https://example.com" required />',
+    '        <input id="targetUrl" type="text" inputmode="url" autocapitalize="off" autocomplete="off" spellcheck="false" placeholder="https://example.com or search..." required />',
     '        <button type="submit">Resurrect</button>',
     "      </form>",
-    '      <label class="options-row"><input id="useWayback" type="checkbox" /> Check Wayback Machine snapshot first (for offline/dead sites)</label>',
+    '      <label class="options-row"><input id="useWayback" type="checkbox" /> Server-side Wayback Machine snapshot (for dead/offline sites)</label>',
     '      <div id="status"></div>',
     "    </section>",
     "  </main>",
@@ -408,16 +652,11 @@ function getBibleHTML() {
     "        for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);",
     '        return btoa(bin).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/, "");',
     "      }",
-    "      async function resolveWaybackUrl(targetUrl) {",
-    '        statusEl.textContent = "Searching Wayback Machine archives...";',
-    '        const api = "https://archive.org/wayback/available?url=" + encodeURIComponent(targetUrl);',
-    "        const res = await fetch(api);",
-    "        const data = await res.json();",
-    "        const closest = data && data.archived_snapshots && data.archived_snapshots.closest;",
-    "        if (closest && closest.available && closest.url) {",
-    '          return closest.url.replace(/^http:\\/\\//i, "https://");',
-    "        }",
-    "        return null;",
+    "      function normalizeInput(raw) {",
+    "        const val = raw.trim();",
+    '        if (/^https?:\\/\\//i.test(val)) return val;',
+    '        if (/^[a-z0-9-]+(\\.[a-z0-9-]+)+([\\/?#].*)?$/i.test(val)) return "https://" + val;',
+    '        return "https://duckduckgo.com/?q=" + encodeURIComponent(val);',
     "      }",
     '      filterInput.addEventListener("input", function() {',
     "        const q = filterInput.value.trim().toLowerCase();",
@@ -440,20 +679,13 @@ function getBibleHTML() {
     "        if (chap < book.chapters) { chapterSelect.value = chap + 1; loadChapter(bookSelect.value, chap + 1); }",
     "        else if (idx < BOOKS.length - 1) { const nextBook = BOOKS[idx + 1]; bookSelect.value = nextBook.id; populateChapters(nextBook.id, 1); loadChapter(nextBook.id, 1); }",
     "      });",
-    '      document.getElementById("uvForm").addEventListener("submit", async function(e) {',
+    '      document.getElementById("uvForm").addEventListener("submit", function(e) {',
     "        e.preventDefault();",
-    '        let destination = document.getElementById("targetUrl").value.trim();',
-    '        if (!/^https?:\\/\\//i.test(destination)) destination = "https://" + destination;',
-    "        try {",
-    '          if (document.getElementById("useWayback").checked) {',
-    "            const archived = await resolveWaybackUrl(destination);",
-    '            if (archived) destination = archived; else statusEl.textContent = "No archive found; routing live URL...";',
-    "          }",
-    '          statusEl.textContent = "Routing...";',
-    "          window.location.href = PROXY_PREFIX + encodeURIComponent(encodeUrl(destination));",
-    "        } catch (err) {",
-    '          statusEl.textContent = "Routing error: " + err.message;',
-    "        }",
+    '        const raw = document.getElementById("targetUrl").value;',
+    "        const destination = normalizeInput(raw);",
+    '        const wayback = document.getElementById("useWayback").checked ? "?wayback=1" : "";',
+    '        statusEl.textContent = wayback ? "Resolving archive on server..." : "Routing...";',
+    "        window.location.href = PROXY_PREFIX + encodeURIComponent(encodeUrl(destination)) + wayback;",
     "      });",
     '      fullscreenBtn.addEventListener("click", async function() {',
     "        try {",
