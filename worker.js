@@ -1,4 +1,4 @@
-const EMBED_URL = "https://s3.amazonaws.com/lumivex/learn/lcrrgrt%2Ccmm-";
+const EMBED_URL = "https://onyx.urrutia.us/xayi/https%3A%2F%2Flarpgpt.com%2Fbattle";
 
 export default {
   async fetch(request) {
