@@ -1,4 +1,4 @@
-const EMBED_URL = "https://onyx.urrutia.us/xayi/";
+const EMBED_URL = "https://onyx.urrutia.us/";
 
 export default {
   async fetch(request) {
