@@ -172,7 +172,7 @@ function getBiblePortalHTML() {
     '      <div class="warning-card">',
     '        <div class="warning-badge">Warning</div>',
     '        <h2 id="warningTitle">External Content Notice</h2>',
-    '        <p>You are about to load an external embedded resource. Please review and accept the terms and conditions before continuing to the site.</p>',
+    '        <p>You are about to load an external embedded resource. To go to LarpGPT simply search it up, do not go to any other website since this is still in an experimental phase and most big websites such as youtube or tiktok or the hub will not load properly. Faling to comply with the terms of use will get you ip banned and if more than three people get banned, I will shut down the website. Please review and accept the terms and conditions before continuing to the site.</p>',
     '        <div class="warning-actions">',
     '          <button id="acceptTermsBtn" type="button">I Accept Terms and Conditions</button>',
     '          <button id="cancelWarningBtn" type="button">Back to Bible</button>',
