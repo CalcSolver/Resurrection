@@ -1,4 +1,4 @@
-const EMBED_URL = "https://onyx.urrutia.us/";
+const EMBED_URL = "https://onyx.urrutia.us";
 
 export default {
   async fetch(request) {
@@ -94,7 +94,7 @@ function getBiblePortalHTML() {
     "<head>",
     '  <meta charset="UTF-8" />',
     '  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />',
-    "  <title>Resurrcction — Scripture</title>",
+    "  <title>Online Bible</title>",
     "  <style>",
     "    :root { --bg: #0d0f13; --surface: #151820; --text: #e8eaef; --muted: #8a92a6; --accent: #d4af37; --border: #252a36; --danger: #f59e0b; }",
     "    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }",
@@ -149,7 +149,7 @@ function getBiblePortalHTML() {
     "<body>",
     '  <div id="readerView">',
     "    <header>",
-    '      <div class="brand">RESURRCCTION</div>',
+    '      <div class="brand">RESURRECTION</div>',
     '      <div class="controls">',
     '        <select id="bookSelect" aria-label="Book"></select>',
     '        <select id="chapterSelect" aria-label="Chapter"></select>',
@@ -179,7 +179,7 @@ function getBiblePortalHTML() {
     "        </div>",
     "      </div>",
     "    </div>",
-    '    <iframe id="targetFrame" src="" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
+    '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms allow-popups-to-escape-sandbox" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
     '    <div id="dock">',
     '      <button id="bibleBtn" class="dock-btn" type="button">Bible</button>',
     '      <button id="reloadBtn" class="dock-btn" type="button">Reload</button>',
