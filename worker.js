@@ -10,6 +10,52 @@ const FIREBASE_CONFIG = {
   appId: "1:735863506276:ios:ded15b8acf2225f76e2671"
 };
 
+const AD_PATTERNS = [
+  "googlesyndication.com",
+  "doubleclick.net",
+  "googleadservices.com",
+  "google-analytics.com",
+  "googletagmanager.com",
+  "googletagservices.com",
+  "adservice.google.com",
+  "pagead2.googlesyndication.com",
+  "tpc.googlesyndication.com",
+  "video-ad-stats.googlesyndication.com",
+  "ads.google.com",
+  "adssettings.google.com",
+  "static.ads-twitter.com",
+  "ads-api.twitter.com",
+  "ads.facebook.com",
+  "an.facebook.com",
+  "adnxs.com",
+  "advertising.com",
+  "outbrain.com",
+  "taboola.com",
+  "criteo.com",
+  "pubmatic.com",
+  "rubiconproject.com",
+  "openx.net",
+  "adsafeprotected.com",
+  "moatads.com",
+  "scorecardresearch.com",
+  "/ads/",
+  "/ad/",
+  "/advert/",
+  "/advertisement/",
+  "/adsense/",
+  "/adserver/",
+  "/analytics/",
+  "prebid",
+  "advertis",
+  "banner",
+  "popup"
+];
+
+function isAdRequest(targetUrl) {
+  const lower = String(targetUrl || "").toLowerCase();
+  return AD_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -28,7 +74,7 @@ export default {
       });
     }
 
-    if (url.pathname === PROXY_PATH) {
+    if (url.pathname === PROXY_PATH || url.pathname.startsWith("/proxy/")) {
       return handleProxiedFrame(request, url);
     }
 
@@ -36,16 +82,32 @@ export default {
   }
 };
 
+function resolveProxyTarget(url) {
+  if (url.pathname.startsWith("/proxy/")) {
+    const rawEncoded = url.pathname.slice("/proxy/".length);
+    const decoded = decodeURIComponent(rawEncoded) + (url.search || "");
+    return new URL(decoded, EMBED_URL);
+  }
+  const paramUrl = url.searchParams.get("u");
+  if (paramUrl) {
+    return new URL(paramUrl, EMBED_URL);
+  }
+  return new URL(EMBED_URL);
+}
+
 async function handleProxiedFrame(request, url) {
-  const rawTarget = url.searchParams.get("u") || EMBED_URL;
   let parsedTarget;
   try {
-    parsedTarget = new URL(rawTarget, EMBED_URL);
+    parsedTarget = resolveProxyTarget(url);
     if (!/^https?:$/i.test(parsedTarget.protocol)) {
       return new Response("Unsupported protocol", { status: 400 });
     }
   } catch {
     return new Response("Invalid URL", { status: 400 });
+  }
+
+  if (isAdRequest(parsedTarget.toString())) {
+    return new Response("", { status: 204 });
   }
 
   const reqHeaders = new Headers(request.headers);
@@ -56,6 +118,12 @@ async function handleProxiedFrame(request, url) {
   reqHeaders.delete("x-forwarded-proto");
   reqHeaders.delete("x-real-ip");
   reqHeaders.delete("accept-encoding");
+  if (!reqHeaders.has("User-Agent")) {
+    reqHeaders.set(
+      "User-Agent",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    );
+  }
 
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   let upstreamRes;
@@ -80,40 +148,13 @@ async function handleProxiedFrame(request, url) {
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
     const baseHref = `<base href="${parsedTarget.toString().replace(/"/g, "&quot;")}">`;
-    const watcherScript = [
-      "<script>",
-      "(function(){",
-      "const parentOrigin = window.location.origin;",
-      "function report(val){",
-      "  if(typeof val === 'string' && val.trim()){",
-      "    try{ window.parent.postMessage({ type: 'checkText', text: val }, parentOrigin); }catch(e){}",
-      "  }",
-      "}",
-      "document.addEventListener('input', function(e){",
-      "  const el = e.target;",
-      "  if(!el) return;",
-      "  if(typeof el.value === 'string') report(el.value);",
-      "  else if(el.isContentEditable) report(el.textContent || '');",
-      "}, true);",
-      "document.addEventListener('paste', function(e){",
-      "  const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';",
-      "  if(pasted) report(pasted);",
-      "  const el = e.target;",
-      "  if(el && typeof el.value === 'string'){",
-      "    setTimeout(function(){ report(el.value); }, 0);",
-      "  }",
-      "}, true);",
-      "})();",
-      "</" + "script>"
-    ].join("");
+    const injectedBlock = buildInjectedFrameScript(AD_PATTERNS);
 
     html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
     if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head[^>]*>/i, function (m) {
-        return m + baseHref + watcherScript;
-      });
+      html = html.replace(/<head[^>]*>/i, (m) => m + baseHref + injectedBlock);
     } else {
-      html = baseHref + watcherScript + html;
+      html = baseHref + injectedBlock + html;
     }
 
     resHeaders.delete("Content-Length");
@@ -124,11 +165,126 @@ async function handleProxiedFrame(request, url) {
     });
   }
 
+  if (contentType.includes("javascript") || contentType.includes("application/x-javascript")) {
+    if (isAdRequest(parsedTarget.toString())) {
+      return new Response("// Ad script blocked", {
+        status: 200,
+        headers: { "Content-Type": "application/javascript" }
+      });
+    }
+  }
+
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
     statusText: upstreamRes.statusText,
     headers: resHeaders
   });
+}
+
+function buildInjectedFrameScript(adPatterns) {
+  const adSelectors = [
+    'iframe[src*="googlesyndication"]',
+    'iframe[src*="doubleclick"]',
+    'iframe[src*="google-analytics"]',
+    'div[id*="google_ads"]',
+    'div[class*="adsbygoogle"]',
+    "ins.adsbygoogle",
+    "[data-ad-slot]",
+    "[data-ad-client]",
+    ".a-div-horizontal",
+    ".a-div-vertical",
+    ".a-div-placeholder",
+    ".a-div-box",
+    '[class*="ad-banner"]',
+    '[id*="ad-banner"]',
+    '[class*="popup-ad"]',
+    '[id*="popup-ad"]'
+  ];
+
+  return [
+    "<style id=\"portal-ad-hide-css\">",
+    adSelectors.join(", ") + " {",
+    "  display: none !important;",
+    "  visibility: hidden !important;",
+    "  opacity: 0 !important;",
+    "  pointer-events: none !important;",
+    "  width: 0 !important;",
+    "  height: 0 !important;",
+    "  overflow: hidden !important;",
+    "}",
+    "</style>",
+    "<script id=\"portal-watcher-ads-js\">",
+    "(function(){",
+    "  const parentOrigin = window.location.origin;",
+    "  const adPatterns = " + JSON.stringify(adPatterns) + ";",
+    "  const adSelectors = " + JSON.stringify(adSelectors) + ";",
+    "  function isAdUrl(u){",
+    "    if(!u) return false;",
+    "    const s = String(u).toLowerCase();",
+    "    return adPatterns.some(function(p){ return s.indexOf(p) !== -1; });",
+    "  }",
+    "  function reportText(val){",
+    "    if(typeof val === 'string' && val.trim()){",
+    "      try{ window.parent.postMessage({ type: 'checkText', text: val }, parentOrigin); }catch(e){}",
+    "    }",
+    "  }",
+    "  const origFetch = window.fetch;",
+    "  if(origFetch){",
+    "    window.fetch = function(input, init){",
+    "      const reqUrl = typeof input === 'string' ? input : (input && input.url) || '';",
+    "      if(isAdUrl(reqUrl)){",
+    "        return Promise.reject(new Error('Ad blocked'));",
+    "      }",
+    "      return origFetch.apply(this, arguments);",
+    "    };",
+    "  }",
+    "  const origOpen = XMLHttpRequest.prototype.open;",
+    "  XMLHttpRequest.prototype.open = function(method, u){",
+    "    if(isAdUrl(u)){",
+    "      this._adBlocked = true;",
+    "      return;",
+    "    }",
+    "    return origOpen.apply(this, arguments);",
+    "  };",
+    "  const origSend = XMLHttpRequest.prototype.send;",
+    "  XMLHttpRequest.prototype.send = function(){",
+    "    if(this._adBlocked) return;",
+    "    return origSend.apply(this, arguments);",
+    "  };",
+    "  function cleanAds(){",
+    "    adSelectors.forEach(function(sel){",
+    "      document.querySelectorAll(sel).forEach(function(el){",
+    "        el.style.setProperty('display', 'none', 'important');",
+    "        try{ el.remove(); }catch(e){}",
+    "      });",
+    "    });",
+    "  }",
+    "  cleanAds();",
+    "  if(document.readyState === 'loading'){",
+    "    document.addEventListener('DOMContentLoaded', cleanAds);",
+    "  }",
+    "  setInterval(cleanAds, 500);",
+    "  const obs = new MutationObserver(cleanAds);",
+    "  if(document.documentElement){",
+    "    obs.observe(document.documentElement, { childList: true, subtree: true });",
+    "  }",
+    "  document.addEventListener('input', function(e){",
+    "    const el = e.target;",
+    "    if(!el) return;",
+    "    if(typeof el.value === 'string') reportText(el.value);",
+    "    else if(el.isContentEditable) reportText(el.textContent || '');",
+    "  }, true);",
+    "  document.addEventListener('paste', function(e){",
+    "    const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';",
+    "    if(pasted) reportText(pasted);",
+    "    const el = e.target;",
+    "    if(el && typeof el.value === 'string'){",
+    "      setTimeout(function(){ reportText(el.value); }, 0);",
+    "    }",
+    "  }, true);",
+    "})();",
+    "</" + "script>"
+  ].join("\n");
 }
 
 function getBiblePortalHTML(clientIp) {
@@ -200,6 +356,8 @@ function getBiblePortalHTML(clientIp) {
     { id: "jude", name: "Jude", chapters: 1 },
     { id: "revelation", name: "Revelation", chapters: 22 }
   ]);
+
+  const frameSrc = `${PROXY_PATH}?u=${encodeURIComponent(EMBED_URL)}`;
 
   return [
     "<!DOCTYPE html>",
@@ -477,8 +635,7 @@ function getBiblePortalHTML(clientIp) {
     "  </" + "script>",
     "  <script>",
     "    (function() {",
-    "      const EMBED_URL = " + JSON.stringify(EMBED_URL) + ";",
-    "      const PROXY_PATH = " + JSON.stringify(PROXY_PATH) + ";",
+    "      const FRAME_SRC = " + JSON.stringify(frameSrc) + ";",
     '      const START_BOOK = "genesis";',
     "      const START_CHAPTER = 1;",
     "      const BOOKS = " + booksJson + ";",
@@ -498,10 +655,6 @@ function getBiblePortalHTML(clientIp) {
     '      const bibleBtn = document.getElementById("bibleBtn");',
     '      const reloadBtn = document.getElementById("reloadBtn");',
     '      const fullscreenBtn = document.getElementById("fullscreenBtn");',
-    "      let useProxyFallback = false;",
-    "      function getFrameTargetUrl() {",
-    "        return useProxyFallback ? (PROXY_PATH + '?u=' + encodeURIComponent(EMBED_URL)) : EMBED_URL;",
-    "      }",
     "      function onLuke54Click() {",
     "        if (typeof window.handleLuke54Trigger === 'function') {",
     "          window.handleLuke54Trigger();",
@@ -515,7 +668,7 @@ function getBiblePortalHTML(clientIp) {
     '        warningScreen.classList.remove("active");',
     '        namePromptBox.classList.remove("active");',
     '        targetFrame.classList.add("active");',
-    "        targetFrame.src = getFrameTargetUrl();",
+    "        targetFrame.src = FRAME_SRC;",
     "      }",
     "      function closePortal() {",
     '        targetFrame.classList.remove("active");',
@@ -525,12 +678,6 @@ function getBiblePortalHTML(clientIp) {
     '        portalView.classList.remove("active");',
     '        readerView.classList.remove("hidden");',
     "      }",
-    "      targetFrame.addEventListener('error', function() {",
-    "        if (!useProxyFallback && targetFrame.classList.contains('active')) {",
-    "          useProxyFallback = true;",
-    "          targetFrame.src = getFrameTargetUrl();",
-    "        }",
-    "      });",
     "      BOOKS.forEach(function(book) {",
     '        const opt = document.createElement("option");',
     "        opt.value = book.id;",
@@ -612,7 +759,7 @@ function getBiblePortalHTML(clientIp) {
     '      nameCancelBtn.addEventListener("click", closePortal);',
     '      bibleBtn.addEventListener("click", closePortal);',
     '      reloadBtn.addEventListener("click", function() {',
-    '        if (targetFrame.classList.contains("active")) targetFrame.src = getFrameTargetUrl();',
+    '        if (targetFrame.classList.contains("active")) targetFrame.src = FRAME_SRC;',
     "      });",
     '      fullscreenBtn.addEventListener("click", async function() {',
     "        try {",
