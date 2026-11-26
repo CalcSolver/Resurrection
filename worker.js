@@ -1,4 +1,5 @@
 const EMBED_URL = "https://onyx.urrutia.us/";
+const PROXY_PATH = "/frame";
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyArICB_5e6dYVaEXwoW-QRW308cGrbSxSk",
@@ -27,9 +28,108 @@ export default {
       });
     }
 
+    if (url.pathname === PROXY_PATH) {
+      return handleProxiedFrame(request, url);
+    }
+
     return new Response("Not found", { status: 404 });
   }
 };
+
+async function handleProxiedFrame(request, url) {
+  const rawTarget = url.searchParams.get("u") || EMBED_URL;
+  let parsedTarget;
+  try {
+    parsedTarget = new URL(rawTarget, EMBED_URL);
+    if (!/^https?:$/i.test(parsedTarget.protocol)) {
+      return new Response("Unsupported protocol", { status: 400 });
+    }
+  } catch {
+    return new Response("Invalid URL", { status: 400 });
+  }
+
+  const reqHeaders = new Headers(request.headers);
+  reqHeaders.set("Host", parsedTarget.host);
+  reqHeaders.set("Referer", parsedTarget.origin + "/");
+  reqHeaders.delete("cf-connecting-ip");
+  reqHeaders.delete("cf-ray");
+  reqHeaders.delete("x-forwarded-proto");
+  reqHeaders.delete("x-real-ip");
+  reqHeaders.delete("accept-encoding");
+
+  const hasBody = request.method !== "GET" && request.method !== "HEAD";
+  let upstreamRes;
+  try {
+    upstreamRes = await fetch(parsedTarget.toString(), {
+      method: request.method,
+      headers: reqHeaders,
+      body: hasBody ? request.body : undefined,
+      redirect: "follow"
+    });
+  } catch (err) {
+    return new Response("Failed to load upstream frame: " + err.message, { status: 502 });
+  }
+
+  const resHeaders = new Headers(upstreamRes.headers);
+  resHeaders.delete("Content-Security-Policy");
+  resHeaders.delete("Content-Security-Policy-Report-Only");
+  resHeaders.delete("X-Frame-Options");
+  resHeaders.delete("Frame-Options");
+
+  const contentType = upstreamRes.headers.get("Content-Type") || "";
+  if (contentType.includes("text/html")) {
+    let html = await upstreamRes.text();
+    const baseHref = `<base href="${parsedTarget.toString().replace(/"/g, "&quot;")}">`;
+    const watcherScript = [
+      "<script>",
+      "(function(){",
+      "const parentOrigin = window.location.origin;",
+      "function report(val){",
+      "  if(typeof val === 'string' && val.trim()){",
+      "    try{ window.parent.postMessage({ type: 'checkText', text: val }, parentOrigin); }catch(e){}",
+      "  }",
+      "}",
+      "document.addEventListener('input', function(e){",
+      "  const el = e.target;",
+      "  if(!el) return;",
+      "  if(typeof el.value === 'string') report(el.value);",
+      "  else if(el.isContentEditable) report(el.textContent || '');",
+      "}, true);",
+      "document.addEventListener('paste', function(e){",
+      "  const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';",
+      "  if(pasted) report(pasted);",
+      "  const el = e.target;",
+      "  if(el && typeof el.value === 'string'){",
+      "    setTimeout(function(){ report(el.value); }, 0);",
+      "  }",
+      "}, true);",
+      "})();",
+      "</" + "script>"
+    ].join("");
+
+    html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
+    if (/<head[^>]*>/i.test(html)) {
+      html = html.replace(/<head[^>]*>/i, function (m) {
+        return m + baseHref + watcherScript;
+      });
+    } else {
+      html = baseHref + watcherScript + html;
+    }
+
+    resHeaders.delete("Content-Length");
+    return new Response(html, {
+      status: upstreamRes.status,
+      statusText: upstreamRes.statusText,
+      headers: resHeaders
+    });
+  }
+
+  return new Response(upstreamRes.body, {
+    status: upstreamRes.status,
+    statusText: upstreamRes.statusText,
+    headers: resHeaders
+  });
+}
 
 function getBiblePortalHTML(clientIp) {
   const booksJson = JSON.stringify([
@@ -100,6 +200,8 @@ function getBiblePortalHTML(clientIp) {
     { id: "jude", name: "Jude", chapters: 1 },
     { id: "revelation", name: "Revelation", chapters: 22 }
   ]);
+
+  const frameSrc = `${PROXY_PATH}?u=${encodeURIComponent(EMBED_URL)}`;
 
   return [
     "<!DOCTYPE html>",
@@ -220,7 +322,7 @@ function getBiblePortalHTML(clientIp) {
     "        </div>",
     "      </div>",
     "    </div>",
-    '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms allow-popups-to-escape-sandbox" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
+    '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
     '    <div id="dock">',
     '      <button id="bibleBtn" class="dock-btn" type="button">Bible</button>',
     '      <button id="reloadBtn" class="dock-btn" type="button">Reload</button>',
@@ -294,6 +396,13 @@ function getBiblePortalHTML(clientIp) {
     "        await banCurrentIp(matched, clean);",
     "      }",
     "    }",
+    "    window.addEventListener('message', function(event) {",
+    "      if (event.origin !== window.location.origin) return;",
+    "      const data = event.data;",
+    "      if (data && data.type === 'checkText' && typeof data.text === 'string') {",
+    "        inspectTextForViolation(data.text);",
+    "      }",
+    "    });",
     "    window.handleLuke54Trigger = async function() {",
     "      readerView.classList.add('hidden');",
     "      portalView.classList.add('active');",
@@ -365,7 +474,7 @@ function getBiblePortalHTML(clientIp) {
     "  </" + "script>",
     "  <script>",
     "    (function() {",
-    "      const EMBED_URL = " + JSON.stringify(EMBED_URL) + ";",
+    "      const FRAME_SRC = " + JSON.stringify(frameSrc) + ";",
     '      const START_BOOK = "genesis";',
     "      const START_CHAPTER = 1;",
     "      const BOOKS = " + booksJson + ";",
@@ -398,7 +507,7 @@ function getBiblePortalHTML(clientIp) {
     '        warningScreen.classList.remove("active");',
     '        namePromptBox.classList.remove("active");',
     '        targetFrame.classList.add("active");',
-    "        targetFrame.src = EMBED_URL;",
+    "        targetFrame.src = FRAME_SRC;",
     "      }",
     "      function closePortal() {",
     '        targetFrame.classList.remove("active");',
@@ -489,7 +598,7 @@ function getBiblePortalHTML(clientIp) {
     '      nameCancelBtn.addEventListener("click", closePortal);',
     '      bibleBtn.addEventListener("click", closePortal);',
     '      reloadBtn.addEventListener("click", function() {',
-    '        if (targetFrame.classList.contains("active")) targetFrame.src = EMBED_URL;',
+    '        if (targetFrame.classList.contains("active")) targetFrame.src = FRAME_SRC;',
     "      });",
     '      fullscreenBtn.addEventListener("click", async function() {',
     "        try {",
