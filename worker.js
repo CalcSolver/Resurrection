@@ -1,6 +1,23 @@
-const ALLOWED_ORIGIN = "https://www.kickmx.com";
-const ALLOWED_HOSTS = ["kickmx.com", "www.kickmx.com"];
-const PORTAL_ENTRY = "/portal/";
+const TARGETS = {
+  kickmx: {
+    label: "KickMX",
+    origin: "https://www.kickmx.com",
+    hosts: ["kickmx.com", "www.kickmx.com"]
+  },
+  larpgpt: {
+    label: "LarpGPT",
+    origin: "https://larpgpt.com/",
+    hosts: ["larpgpt", "www.larpgpt", "larpgpt.com", "www.websim.com"]
+  },
+  tiktok: {
+    label: "TikTok",
+    origin: "https://www.tiktok.com",
+    hosts: ["tiktok.com", "www.tiktok.com", "m.tiktok.com"]
+  }
+};
+
+const DEFAULT_TARGET_KEY = "kickmx";
+const PROXY_PREFIX = "/go";
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyArICB_5e6dYVaEXwoW-QRW308cGrbSxSk",
@@ -11,9 +28,23 @@ const FIREBASE_CONFIG = {
   appId: "1:735863506276:ios:ded15b8acf2225f76e2671"
 };
 
+function getAllAllowedHosts() {
+  const list = [];
+  Object.values(TARGETS).forEach((t) => {
+    (t.hosts || []).forEach((h) => list.push(h.toLowerCase()));
+  });
+  return list;
+}
+
+const ALL_ALLOWED_HOSTS = getAllAllowedHosts();
+
 function isAllowedHost(hostname) {
   const clean = String(hostname || "").toLowerCase();
-  return ALLOWED_HOSTS.some((h) => clean === h || clean.endsWith("." + h));
+  return ALL_ALLOWED_HOSTS.some((h) => clean === h || clean.endsWith("." + h));
+}
+
+function getTargetConfig(key) {
+  return TARGETS[key] || TARGETS[DEFAULT_TARGET_KEY];
 }
 
 export default {
@@ -34,27 +65,46 @@ export default {
       });
     }
 
-    return handleLockedProxy(request, url);
+    if (url.pathname === PROXY_PREFIX || url.pathname.startsWith(PROXY_PREFIX + "/")) {
+      return handleLockedProxy(request, url);
+    }
+
+    return new Response("Not found", { status: 404 });
   }
 };
 
 async function handleLockedProxy(request, url) {
-  let subPath = url.pathname;
-  if (subPath === "/portal" || subPath === "/portal/") {
-    subPath = "/";
-  } else if (subPath.startsWith("/portal/")) {
-    subPath = subPath.slice("/portal".length);
+  // Expected format: /go/<targetKey>/<subpath...>
+  const remainder = url.pathname.slice(PROXY_PREFIX.length).replace(/^\/+/, "");
+  const slashIdx = remainder.indexOf("/");
+  const targetKey = slashIdx === -1 ? remainder || DEFAULT_TARGET_KEY : remainder.slice(0, slashIdx);
+  const subPath = slashIdx === -1 ? "/" : remainder.slice(slashIdx);
+
+  if (!TARGETS[targetKey]) {
+    return new Response("Blocked: Unknown portal target.", {
+      status: 403,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
   }
+
+  const targetCfg = getTargetConfig(targetKey);
+  const baseUrl = new URL(targetCfg.origin);
+  const joinedPath =
+    baseUrl.pathname && baseUrl.pathname !== "/"
+      ? baseUrl.pathname.replace(/\/+$/, "") + (subPath.startsWith("/") ? subPath : "/" + subPath)
+      : subPath.startsWith("/")
+      ? subPath
+      : "/" + subPath;
 
   let targetUrl;
   try {
-    targetUrl = new URL(subPath + url.search, ALLOWED_ORIGIN);
+    targetUrl = new URL(joinedPath + url.search, baseUrl.origin);
   } catch {
     return new Response("Invalid destination", { status: 400 });
   }
 
   if (!/^https?:$/i.test(targetUrl.protocol) || !isAllowedHost(targetUrl.hostname)) {
-    return new Response("Blocked: Only kickmx.com is allowed on this portal.", {
+    return new Response("Blocked: Destination outside allowed targets.", {
       status: 403,
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
@@ -62,8 +112,8 @@ async function handleLockedProxy(request, url) {
 
   const reqHeaders = new Headers(request.headers);
   reqHeaders.set("Host", targetUrl.host);
-  reqHeaders.set("Origin", ALLOWED_ORIGIN);
-  reqHeaders.set("Referer", ALLOWED_ORIGIN + "/");
+  reqHeaders.set("Origin", baseUrl.origin);
+  reqHeaders.set("Referer", baseUrl.origin + "/");
   reqHeaders.delete("cf-connecting-ip");
   reqHeaders.delete("cf-ray");
   reqHeaders.delete("x-forwarded-proto");
@@ -86,7 +136,7 @@ async function handleLockedProxy(request, url) {
       redirect: "manual"
     });
   } catch (err) {
-    return new Response("Failed to reach kickmx.com: " + err.message, { status: 502 });
+    return new Response("Failed to reach target: " + err.message, { status: 502 });
   }
 
   if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
@@ -97,9 +147,10 @@ async function handleLockedProxy(request, url) {
         if (!isAllowedHost(nextUrl.hostname)) {
           return new Response("Blocked external redirect.", { status: 403 });
         }
+        const rewrittenLoc = `${PROXY_PREFIX}/${targetKey}${nextUrl.pathname}${nextUrl.search}`;
         return new Response(null, {
           status: upstreamRes.status,
-          headers: { Location: nextUrl.pathname + nextUrl.search }
+          headers: { Location: rewrittenLoc }
         });
       } catch {
         return new Response("Blocked invalid redirect.", { status: 403 });
@@ -117,10 +168,13 @@ async function handleLockedProxy(request, url) {
   const contentType = upstreamRes.headers.get("Content-Type") || "";
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
+    const baseHref = `<base href="${targetUrl.toString().replace(/"/g, "&quot;")}">`;
+    const routePrefix = `${PROXY_PREFIX}/${targetKey}`;
     const lockScript = [
       "<script>",
       "(function(){",
-      "  const ALLOWED = ['kickmx.com', 'www.kickmx.com'];",
+      "  const ALLOWED = " + JSON.stringify(ALL_ALLOWED_HOSTS) + ";",
+      "  const ROUTE_PREFIX = " + JSON.stringify(routePrefix) + ";",
       "  function allowed(u){",
       "    try{",
       "      const parsed = new URL(u, window.location.origin);",
@@ -140,7 +194,7 @@ async function handleLockedProxy(request, url) {
       "      const parsed = new URL(a.href);",
       "      if(parsed.origin !== window.location.origin){",
       "        e.preventDefault();",
-      "        window.location.href = parsed.pathname + parsed.search;",
+      "        window.location.href = ROUTE_PREFIX + parsed.pathname + parsed.search;",
       "      }",
       "    }catch(err){}",
       "  }, true);",
@@ -148,14 +202,11 @@ async function handleLockedProxy(request, url) {
       "</" + "script>"
     ].join("");
 
-    html = html
-      .replace(/https?:\/\/(?:www\.)?kickmx\.com/gi, "")
-      .replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
-
+    html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
     if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head[^>]*>/i, (m) => m + lockScript);
+      html = html.replace(/<head[^>]*>/i, (m) => m + baseHref + lockScript);
     } else {
-      html = lockScript + html;
+      html = baseHref + lockScript + html;
     }
 
     resHeaders.delete("Content-Length");
@@ -243,6 +294,14 @@ function getBiblePortalHTML(clientIp) {
     { id: "revelation", name: "Revelation", chapters: 22 }
   ]);
 
+  const targetListJson = JSON.stringify(
+    Object.entries(TARGETS).map(([key, cfg]) => ({
+      key,
+      label: cfg.label,
+      url: `${PROXY_PREFIX}/${key}/`
+    }))
+  );
+
   return [
     "<!DOCTYPE html>",
     '<html lang="en">',
@@ -289,7 +348,8 @@ function getBiblePortalHTML(clientIp) {
     "    #cancelWarningBtn, #nameCancelBtn { background: transparent; color: var(--muted); border-color: var(--border); font-size: 14px; }",
     "    #targetFrame { display: none; width: 100%; height: 100%; border: none; background: #ffffff; }",
     "    #targetFrame.active { display: block; }",
-    "    #dock { position: fixed; bottom: calc(14px + env(safe-area-inset-bottom)); right: calc(14px + env(safe-area-inset-right)); z-index: 2147483647; display: flex; gap: 8px; flex-wrap: wrap; }",
+    "    #dock { position: fixed; bottom: calc(14px + env(safe-area-inset-bottom)); right: calc(14px + env(safe-area-inset-right)); z-index: 2147483647; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }",
+    "    #targetSelect { min-height: 42px; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--accent); background: rgba(21, 24, 32, 0.92); color: var(--text); font-family: system-ui, -apple-system, sans-serif; font-size: 13px; font-weight: 600; }",
     "    .dock-btn { min-height: 42px; padding: 8px 14px; border-radius: 999px; border: 1px solid var(--accent); background: rgba(21, 24, 32, 0.92); color: var(--accent); font-family: system-ui, -apple-system, sans-serif; font-size: 13px; font-weight: 600; cursor: pointer; backdrop-filter: blur(6px); box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45); touch-action: manipulation; }",
     "    #banScreen { display: none; position: fixed; inset: 0; z-index: 2147483647; background: rgba(13, 15, 19, 0.98); align-items: center; justify-content: center; padding: 1.25rem; font-family: system-ui, -apple-system, sans-serif; }",
     "    #banScreen.active { display: flex; }",
@@ -355,7 +415,7 @@ function getBiblePortalHTML(clientIp) {
     '      <div class="warning-card">',
     '        <div class="warning-badge">Warning</div>',
     '        <h2 id="warningTitle">External Content Notice</h2>',
-    "        <p>You are about to load the allowed external resource. Please review and accept the terms and conditions before continuing.</p>",
+    "        <p>You are about to load an allowed external resource. Please review and accept the terms and conditions before continuing.</p>",
     '        <div class="warning-actions">',
     '          <button id="acceptTermsBtn" type="button">I Accept Terms and Conditions</button>',
     '          <button id="cancelWarningBtn" type="button">Back to Bible</button>',
@@ -364,6 +424,7 @@ function getBiblePortalHTML(clientIp) {
     "    </div>",
     '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
     '    <div id="dock">',
+    '      <select id="targetSelect" aria-label="Portal Destination"></select>',
     '      <button id="bibleBtn" class="dock-btn" type="button">Bible</button>',
     '      <button id="reloadBtn" class="dock-btn" type="button">Reload</button>',
     '      <button id="fullscreenBtn" class="dock-btn" type="button">Fullscreen</button>',
@@ -453,7 +514,7 @@ function getBiblePortalHTML(clientIp) {
     "  </" + "script>",
     "  <script>",
     "    (function() {",
-    "      const PORTAL_ENTRY = " + JSON.stringify(PORTAL_ENTRY) + ";",
+    "      const TARGET_LIST = " + targetListJson + ";",
     '      const START_BOOK = "genesis";',
     "      const START_CHAPTER = 1;",
     "      const BOOKS = " + booksJson + ";",
@@ -465,6 +526,7 @@ function getBiblePortalHTML(clientIp) {
     '      const cancelWarningBtn = document.getElementById("cancelWarningBtn");',
     '      const nameCancelBtn = document.getElementById("nameCancelBtn");',
     '      const targetFrame = document.getElementById("targetFrame");',
+    '      const targetSelect = document.getElementById("targetSelect");',
     '      const bookSelect = document.getElementById("bookSelect");',
     '      const chapterSelect = document.getElementById("chapterSelect");',
     '      const filterInput = document.getElementById("filterInput");',
@@ -473,6 +535,15 @@ function getBiblePortalHTML(clientIp) {
     '      const bibleBtn = document.getElementById("bibleBtn");',
     '      const reloadBtn = document.getElementById("reloadBtn");',
     '      const fullscreenBtn = document.getElementById("fullscreenBtn");',
+    "      TARGET_LIST.forEach(function(item) {",
+    '        const opt = document.createElement("option");',
+    "        opt.value = item.url;",
+    "        opt.textContent = item.label;",
+    "        targetSelect.appendChild(opt);",
+    "      });",
+    "      function getSelectedTargetUrl() {",
+    "        return targetSelect.value || (TARGET_LIST[0] && TARGET_LIST[0].url) || '/go/kickmx/';",
+    "      }",
     "      function onLuke54Click() {",
     "        if (typeof window.handleLuke54Trigger === 'function') {",
     "          window.handleLuke54Trigger();",
@@ -486,7 +557,7 @@ function getBiblePortalHTML(clientIp) {
     '        warningScreen.classList.remove("active");',
     '        namePromptBox.classList.remove("active");',
     '        targetFrame.classList.add("active");',
-    "        targetFrame.src = PORTAL_ENTRY;",
+    "        targetFrame.src = getSelectedTargetUrl();",
     "      }",
     "      function closePortal() {",
     '        targetFrame.classList.remove("active");',
@@ -496,6 +567,11 @@ function getBiblePortalHTML(clientIp) {
     '        portalView.classList.remove("active");',
     '        readerView.classList.remove("hidden");',
     "      }",
+    '      targetSelect.addEventListener("change", function() {',
+    '        if (targetFrame.classList.contains("active")) {',
+    "          targetFrame.src = getSelectedTargetUrl();",
+    "        }",
+    "      });",
     "      BOOKS.forEach(function(book) {",
     '        const opt = document.createElement("option");',
     "        opt.value = book.id;",
@@ -577,7 +653,7 @@ function getBiblePortalHTML(clientIp) {
     '      nameCancelBtn.addEventListener("click", closePortal);',
     '      bibleBtn.addEventListener("click", closePortal);',
     '      reloadBtn.addEventListener("click", function() {',
-    '        if (targetFrame.classList.contains("active")) targetFrame.src = PORTAL_ENTRY;',
+    '        if (targetFrame.classList.contains("active")) targetFrame.src = getSelectedTargetUrl();',
     "      });",
     '      fullscreenBtn.addEventListener("click", async function() {',
     "        try {",
