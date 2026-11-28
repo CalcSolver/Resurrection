@@ -8,11 +8,19 @@ const TARGETS = {
     label: "LarpGPT",
     origin: "https://larpgpt.com",
     hosts: ["larpgpt.com", "www.larpgpt.com"]
+  },
+  more: {
+    label: "More",
+    origin: "",
+    hosts: [],
+    dynamicFromFirestore: true
   }
 };
 
 const DEFAULT_TARGET_KEY = "kickmx";
 const PROXY_PREFIX = "/go";
+const OTHER_WEBSITES_COLLECTION = "other_websites";
+const OTHER_WEBSITES_DOC_ID = "active";
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyArICB_5e6dYVaEXwoW-QRW308cGrbSxSk",
@@ -23,7 +31,7 @@ const FIREBASE_CONFIG = {
   appId: "1:735863506276:ios:ded15b8acf2225f76e2671"
 };
 
-function getAllAllowedHosts() {
+function getStaticAllowedHosts() {
   const list = [];
   Object.values(TARGETS).forEach((t) => {
     (t.hosts || []).forEach((h) => list.push(h.toLowerCase()));
@@ -31,15 +39,68 @@ function getAllAllowedHosts() {
   return list;
 }
 
-const ALL_ALLOWED_HOSTS = getAllAllowedHosts();
+const STATIC_ALLOWED_HOSTS = getStaticAllowedHosts();
 
-function isAllowedHost(hostname) {
-  const clean = String(hostname || "").toLowerCase();
-  return ALL_ALLOWED_HOSTS.some((h) => clean === h || clean.endsWith("." + h));
+function normalizeTargetUrl(rawValue) {
+  if (typeof rawValue !== "string") return null;
+  let trimmed = rawValue.trim();
+  if (!trimmed) return null;
+  if (!/^https?:\/\//i.test(trimmed)) {
+    trimmed = "https://" + trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (!/^https?:$/i.test(parsed.protocol) || !parsed.hostname) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
 }
 
-function getTargetConfig(key) {
-  return TARGETS[key] || TARGETS[DEFAULT_TARGET_KEY];
+function isHostInList(hostname, hostList) {
+  const clean = String(hostname || "").toLowerCase();
+  if (!clean) return false;
+  return hostList.some((h) => clean === h || clean.endsWith("." + h));
+}
+
+function buildAllowedHostsForTarget(targetKey, customUrlObj) {
+  const list = [...STATIC_ALLOWED_HOSTS];
+  if (targetKey === "more" && customUrlObj && customUrlObj.hostname) {
+    const h = customUrlObj.hostname.toLowerCase();
+    list.push(h);
+    if (h.startsWith("www.")) {
+      list.push(h.slice(4));
+    } else {
+      list.push("www." + h);
+    }
+  }
+  return [...new Set(list)];
+}
+
+async function fetchMoreTargetFromFirestore() {
+  try {
+    const docUrl = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+      FIREBASE_CONFIG.projectId
+    )}/databases/(default)/documents/${encodeURIComponent(
+      OTHER_WEBSITES_COLLECTION
+    )}/${encodeURIComponent(OTHER_WEBSITES_DOC_ID)}?key=${encodeURIComponent(
+      FIREBASE_CONFIG.apiKey
+    )}`;
+    const res = await fetch(docUrl);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const fields = data.fields || {};
+    const candidateKeys = ["url", "website", "link", "target", "href"];
+    for (const key of candidateKeys) {
+      if (fields[key] && typeof fields[key].stringValue === "string") {
+        const parsed = normalizeTargetUrl(fields[key].stringValue);
+        if (parsed) return parsed;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 function detectTargetFromReferer(request) {
@@ -52,7 +113,7 @@ function detectTargetFromReferer(request) {
   return null;
 }
 
-function toProxyUrl(targetKey, rawUrl, currentTargetUrl) {
+function toProxyUrl(targetKey, rawUrl, currentTargetUrl, allowedHosts) {
   if (!rawUrl || typeof rawUrl !== "string") return rawUrl;
   const trimmed = rawUrl.trim();
   if (
@@ -69,18 +130,18 @@ function toProxyUrl(targetKey, rawUrl, currentTargetUrl) {
   try {
     const resolved = new URL(trimmed, currentTargetUrl);
     if (!/^https?:$/i.test(resolved.protocol)) return rawUrl;
-    if (!isAllowedHost(resolved.hostname)) return "#blocked-external";
+    if (!isHostInList(resolved.hostname, allowedHosts)) return "#blocked-external";
     return `${PROXY_PREFIX}/${targetKey}${resolved.pathname}${resolved.search}`;
   } catch {
     return rawUrl;
   }
 }
 
-function rewriteHtmlAttributes(html, targetKey, currentTargetUrl) {
+function rewriteHtmlAttributes(html, targetKey, currentTargetUrl, allowedHosts) {
   return html.replace(
     /(\s(?:href|src|action)=)(["'])([^"']*)(\2)/gi,
     (match, prefix, quote, val, endQuote) => {
-      const proxied = toProxyUrl(targetKey, val, currentTargetUrl);
+      const proxied = toProxyUrl(targetKey, val, currentTargetUrl, allowedHosts);
       return `${prefix}${quote}${proxied}${endQuote}`;
     }
   );
@@ -112,8 +173,6 @@ export default {
       return handleLockedProxy(request, url, targetKey, subPath);
     }
 
-    // If an SPA inside /go/<target>/ pushes or requests a sub-route without /go/<target>/,
-    // infer the target from Referer so it doesn't 404.
     const inferredTarget = detectTargetFromReferer(request);
     if (inferredTarget) {
       return handleLockedProxy(request, url, inferredTarget, url.pathname);
@@ -124,15 +183,30 @@ export default {
 };
 
 async function handleLockedProxy(request, url, targetKey, subPath) {
-  if (!TARGETS[targetKey]) {
+  const targetCfg = TARGETS[targetKey];
+  if (!targetCfg) {
     return new Response("Blocked: Unknown portal target.", {
       status: 403,
       headers: { "Content-Type": "text/plain; charset=utf-8" }
     });
   }
 
-  const targetCfg = getTargetConfig(targetKey);
-  const baseUrl = new URL(targetCfg.origin);
+  let baseUrl;
+  let customMoreUrl = null;
+  if (targetCfg.dynamicFromFirestore) {
+    customMoreUrl = await fetchMoreTargetFromFirestore();
+    if (!customMoreUrl) {
+      return new Response(
+        `No valid website configured in Firestore collection "${OTHER_WEBSITES_COLLECTION}" (doc "${OTHER_WEBSITES_DOC_ID}").`,
+        { status: 404, headers: { "Content-Type": "text/plain; charset=utf-8" } }
+      );
+    }
+    baseUrl = customMoreUrl;
+  } else {
+    baseUrl = new URL(targetCfg.origin);
+  }
+
+  const allowedHosts = buildAllowedHostsForTarget(targetKey, customMoreUrl);
   const cleanSubPath = subPath.startsWith("/") ? subPath : "/" + subPath;
   const joinedPath =
     baseUrl.pathname && baseUrl.pathname !== "/"
@@ -146,7 +220,7 @@ async function handleLockedProxy(request, url, targetKey, subPath) {
     return new Response("Invalid destination", { status: 400 });
   }
 
-  if (!/^https?:$/i.test(targetUrl.protocol) || !isAllowedHost(targetUrl.hostname)) {
+  if (!/^https?:$/i.test(targetUrl.protocol) || !isHostInList(targetUrl.hostname, allowedHosts)) {
     return new Response("Blocked: Destination outside allowed targets.", {
       status: 403,
       headers: { "Content-Type": "text/plain; charset=utf-8" }
@@ -187,7 +261,7 @@ async function handleLockedProxy(request, url, targetKey, subPath) {
     if (loc) {
       try {
         const nextUrl = new URL(loc, targetUrl);
-        if (!isAllowedHost(nextUrl.hostname)) {
+        if (!isHostInList(nextUrl.hostname, allowedHosts)) {
           return new Response("Blocked external redirect.", { status: 403 });
         }
         const rewrittenLoc = `${PROXY_PREFIX}/${targetKey}${nextUrl.pathname}${nextUrl.search}`;
@@ -215,7 +289,7 @@ async function handleLockedProxy(request, url, targetKey, subPath) {
     const clientShim = [
       "<script>",
       "(function(){",
-      "  const ALLOWED = " + JSON.stringify(ALL_ALLOWED_HOSTS) + ";",
+      "  const ALLOWED = " + JSON.stringify(allowedHosts) + ";",
       "  const ROUTE_PREFIX = " + JSON.stringify(routePrefix) + ";",
       "  const UPSTREAM_ORIGIN = " + JSON.stringify(baseUrl.origin) + ";",
       "  function isAllowedUrl(u){",
@@ -301,7 +375,7 @@ async function handleLockedProxy(request, url, targetKey, subPath) {
     ].join("");
 
     html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
-    html = rewriteHtmlAttributes(html, targetKey, targetUrl.toString());
+    html = rewriteHtmlAttributes(html, targetKey, targetUrl.toString(), allowedHosts);
 
     if (/<head[^>]*>/i.test(html)) {
       html = html.replace(/<head[^>]*>/i, (m) => m + clientShim);
