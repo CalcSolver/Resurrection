@@ -47,6 +47,40 @@ function getTargetConfig(key) {
   return TARGETS[key] || TARGETS[DEFAULT_TARGET_KEY];
 }
 
+function toProxyUrl(targetKey, rawUrl, currentTargetUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") return rawUrl;
+  const trimmed = rawUrl.trim();
+  if (
+    trimmed.startsWith("#") ||
+    trimmed.startsWith("javascript:") ||
+    trimmed.startsWith("data:") ||
+    trimmed.startsWith("blob:") ||
+    trimmed.startsWith("mailto:") ||
+    trimmed.startsWith(`${PROXY_PREFIX}/`)
+  ) {
+    return rawUrl;
+  }
+
+  try {
+    const resolved = new URL(trimmed, currentTargetUrl);
+    if (!/^https?:$/i.test(resolved.protocol)) return rawUrl;
+    if (!isAllowedHost(resolved.hostname)) return "#blocked-external";
+    return `${PROXY_PREFIX}/${targetKey}${resolved.pathname}${resolved.search}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
+function rewriteHtmlAttributes(html, targetKey, currentTargetUrl) {
+  return html.replace(
+    /(\s(?:href|src|action)=)(["'])([^"']*)(\2)/gi,
+    (match, prefix, quote, val, endQuote) => {
+      const proxied = toProxyUrl(targetKey, val, currentTargetUrl);
+      return `${prefix}${quote}${proxied}${endQuote}`;
+    }
+  );
+}
+
 export default {
   async fetch(request) {
     const url = new URL(request.url);
@@ -111,8 +145,8 @@ async function handleLockedProxy(request, url) {
 
   const reqHeaders = new Headers(request.headers);
   reqHeaders.set("Host", targetUrl.host);
-  reqHeaders.set("Origin", baseUrl.origin);
   reqHeaders.set("Referer", baseUrl.origin + "/");
+  reqHeaders.delete("origin");
   reqHeaders.delete("cf-connecting-ip");
   reqHeaders.delete("cf-ray");
   reqHeaders.delete("x-forwarded-proto");
@@ -167,45 +201,88 @@ async function handleLockedProxy(request, url) {
   const contentType = upstreamRes.headers.get("Content-Type") || "";
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
-    const baseHref = `<base href="${targetUrl.toString().replace(/"/g, "&quot;")}">`;
     const routePrefix = `${PROXY_PREFIX}/${targetKey}`;
-    const lockScript = [
+    const clientShim = [
       "<script>",
       "(function(){",
       "  const ALLOWED = " + JSON.stringify(ALL_ALLOWED_HOSTS) + ";",
       "  const ROUTE_PREFIX = " + JSON.stringify(routePrefix) + ";",
-      "  function allowed(u){",
+      "  const UPSTREAM_ORIGIN = " + JSON.stringify(baseUrl.origin) + ";",
+      "  function isAllowedUrl(u){",
       "    try{",
-      "      const parsed = new URL(u, window.location.origin);",
-      "      if(parsed.origin === window.location.origin) return true;",
-      "      return ALLOWED.some(function(h){ return parsed.hostname === h || parsed.hostname.endsWith('.' + h); });",
+      "      const p = new URL(u, UPSTREAM_ORIGIN);",
+      "      if(p.origin === window.location.origin) return true;",
+      "      return ALLOWED.some(function(h){ return p.hostname === h || p.hostname.endsWith('.' + h); });",
       "    }catch(e){ return false; }",
       "  }",
+      "  function mapUrl(u){",
+      "    if(!u || typeof u !== 'string') return u;",
+      "    const t = u.trim();",
+      "    if(t.startsWith('#') || t.startsWith('data:') || t.startsWith('blob:') || t.startsWith('javascript:')) return u;",
+      "    if(t.startsWith(ROUTE_PREFIX + '/')) return t;",
+      "    try{",
+      "      const p = new URL(t, UPSTREAM_ORIGIN);",
+      "      if(p.origin === window.location.origin){",
+      "        if(p.pathname.startsWith(ROUTE_PREFIX + '/')) return p.pathname + p.search;",
+      "        return ROUTE_PREFIX + p.pathname + p.search;",
+      "      }",
+      "      if(isAllowedUrl(p.toString())){",
+      "        return ROUTE_PREFIX + p.pathname + p.search;",
+      "      }",
+      "      return null;",
+      "    }catch(e){ return u; }",
+      "  }",
+      "  const origFetch = window.fetch;",
+      "  if(origFetch){",
+      "    window.fetch = function(input, init){",
+      "      const raw = typeof input === 'string' ? input : (input && input.url) || '';",
+      "      const mapped = mapUrl(raw);",
+      "      if(mapped === null) return Promise.reject(new Error('Blocked external request'));",
+      "      if(mapped && mapped !== raw){",
+      "        if(typeof input === 'string') return origFetch.call(this, mapped, init);",
+      "        return origFetch.call(this, new Request(mapped, input), init);",
+      "      }",
+      "      return origFetch.apply(this, arguments);",
+      "    };",
+      "  }",
+      "  const origOpen = XMLHttpRequest.prototype.open;",
+      "  XMLHttpRequest.prototype.open = function(method, u){",
+      "    const mapped = mapUrl(u);",
+      "    if(mapped === null) return;",
+      "    const args = Array.prototype.slice.call(arguments);",
+      "    if(mapped && mapped !== u) args[1] = mapped;",
+      "    return origOpen.apply(this, args);",
+      "  };",
+      "  window.open = function(u){",
+      "    const mapped = mapUrl(u);",
+      "    if(mapped) window.location.href = mapped;",
+      "    return null;",
+      "  };",
       "  document.addEventListener('click', function(e){",
       "    const a = e.target.closest('a[href]');",
       "    if(!a) return;",
-      "    if(!allowed(a.href)){",
+      "    const mapped = mapUrl(a.getAttribute('href'));",
+      "    if(mapped === null){",
       "      e.preventDefault();",
       "      e.stopImmediatePropagation();",
       "      return;",
       "    }",
-      "    try{",
-      "      const parsed = new URL(a.href);",
-      "      if(parsed.origin !== window.location.origin){",
-      "        e.preventDefault();",
-      "        window.location.href = ROUTE_PREFIX + parsed.pathname + parsed.search;",
-      "      }",
-      "    }catch(err){}",
+      "    if(mapped && mapped !== a.getAttribute('href')){",
+      "      e.preventDefault();",
+      "      window.location.href = mapped;",
+      "    }",
       "  }, true);",
       "})();",
       "</" + "script>"
     ].join("");
 
     html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
+    html = rewriteHtmlAttributes(html, targetKey, targetUrl.toString());
+
     if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head[^>]*>/i, (m) => m + baseHref + lockScript);
+      html = html.replace(/<head[^>]*>/i, (m) => m + clientShim);
     } else {
-      html = baseHref + lockScript + html;
+      html = clientShim + html;
     }
 
     resHeaders.delete("Content-Length");
