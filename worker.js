@@ -1,5 +1,6 @@
-const EMBED_URL = "https://onyx.urrutia.us/";
-const PROXY_PATH = "/frame";
+const ALLOWED_ORIGIN = "https://www.kickmx.com";
+const ALLOWED_HOSTS = ["kickmx.com", "www.kickmx.com"];
+const PORTAL_ENTRY = "/portal/";
 
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyArICB_5e6dYVaEXwoW-QRW308cGrbSxSk",
@@ -10,50 +11,9 @@ const FIREBASE_CONFIG = {
   appId: "1:735863506276:ios:ded15b8acf2225f76e2671"
 };
 
-const AD_PATTERNS = [
-  "googlesyndication.com",
-  "doubleclick.net",
-  "googleadservices.com",
-  "google-analytics.com",
-  "googletagmanager.com",
-  "googletagservices.com",
-  "adservice.google.com",
-  "pagead2.googlesyndication.com",
-  "tpc.googlesyndication.com",
-  "video-ad-stats.googlesyndication.com",
-  "ads.google.com",
-  "adssettings.google.com",
-  "static.ads-twitter.com",
-  "ads-api.twitter.com",
-  "ads.facebook.com",
-  "an.facebook.com",
-  "adnxs.com",
-  "advertising.com",
-  "outbrain.com",
-  "taboola.com",
-  "criteo.com",
-  "pubmatic.com",
-  "rubiconproject.com",
-  "openx.net",
-  "adsafeprotected.com",
-  "moatads.com",
-  "scorecardresearch.com",
-  "/ads/",
-  "/ad/",
-  "/advert/",
-  "/advertisement/",
-  "/adsense/",
-  "/adserver/",
-  "/analytics/",
-  "prebid",
-  "advertis",
-  "banner",
-  "popup"
-];
-
-function isAdRequest(targetUrl) {
-  const lower = String(targetUrl || "").toLowerCase();
-  return AD_PATTERNS.some((pattern) => lower.includes(pattern));
+function isAllowedHost(hostname) {
+  const clean = String(hostname || "").toLowerCase();
+  return ALLOWED_HOSTS.some((h) => clean === h || clean.endsWith("." + h));
 }
 
 export default {
@@ -74,45 +34,36 @@ export default {
       });
     }
 
-    if (url.pathname === PROXY_PATH || url.pathname.startsWith("/proxy/")) {
-      return handleProxiedFrame(request, url);
-    }
-
-    return new Response("Not found", { status: 404 });
+    return handleLockedProxy(request, url);
   }
 };
 
-function resolveProxyTarget(url) {
-  if (url.pathname.startsWith("/proxy/")) {
-    const rawEncoded = url.pathname.slice("/proxy/".length);
-    const decoded = decodeURIComponent(rawEncoded) + (url.search || "");
-    return new URL(decoded, EMBED_URL);
+async function handleLockedProxy(request, url) {
+  let subPath = url.pathname;
+  if (subPath === "/portal" || subPath === "/portal/") {
+    subPath = "/";
+  } else if (subPath.startsWith("/portal/")) {
+    subPath = subPath.slice("/portal".length);
   }
-  const paramUrl = url.searchParams.get("u");
-  if (paramUrl) {
-    return new URL(paramUrl, EMBED_URL);
-  }
-  return new URL(EMBED_URL);
-}
 
-async function handleProxiedFrame(request, url) {
-  let parsedTarget;
+  let targetUrl;
   try {
-    parsedTarget = resolveProxyTarget(url);
-    if (!/^https?:$/i.test(parsedTarget.protocol)) {
-      return new Response("Unsupported protocol", { status: 400 });
-    }
+    targetUrl = new URL(subPath + url.search, ALLOWED_ORIGIN);
   } catch {
-    return new Response("Invalid URL", { status: 400 });
+    return new Response("Invalid destination", { status: 400 });
   }
 
-  if (isAdRequest(parsedTarget.toString())) {
-    return new Response("", { status: 204 });
+  if (!/^https?:$/i.test(targetUrl.protocol) || !isAllowedHost(targetUrl.hostname)) {
+    return new Response("Blocked: Only kickmx.com is allowed on this portal.", {
+      status: 403,
+      headers: { "Content-Type": "text/plain; charset=utf-8" }
+    });
   }
 
   const reqHeaders = new Headers(request.headers);
-  reqHeaders.set("Host", parsedTarget.host);
-  reqHeaders.set("Referer", parsedTarget.origin + "/");
+  reqHeaders.set("Host", targetUrl.host);
+  reqHeaders.set("Origin", ALLOWED_ORIGIN);
+  reqHeaders.set("Referer", ALLOWED_ORIGIN + "/");
   reqHeaders.delete("cf-connecting-ip");
   reqHeaders.delete("cf-ray");
   reqHeaders.delete("x-forwarded-proto");
@@ -128,14 +79,32 @@ async function handleProxiedFrame(request, url) {
   const hasBody = request.method !== "GET" && request.method !== "HEAD";
   let upstreamRes;
   try {
-    upstreamRes = await fetch(parsedTarget.toString(), {
+    upstreamRes = await fetch(targetUrl.toString(), {
       method: request.method,
       headers: reqHeaders,
       body: hasBody ? request.body : undefined,
-      redirect: "follow"
+      redirect: "manual"
     });
   } catch (err) {
-    return new Response("Failed to load upstream frame: " + err.message, { status: 502 });
+    return new Response("Failed to reach kickmx.com: " + err.message, { status: 502 });
+  }
+
+  if (upstreamRes.status >= 300 && upstreamRes.status < 400) {
+    const loc = upstreamRes.headers.get("Location");
+    if (loc) {
+      try {
+        const nextUrl = new URL(loc, targetUrl);
+        if (!isAllowedHost(nextUrl.hostname)) {
+          return new Response("Blocked external redirect.", { status: 403 });
+        }
+        return new Response(null, {
+          status: upstreamRes.status,
+          headers: { Location: nextUrl.pathname + nextUrl.search }
+        });
+      } catch {
+        return new Response("Blocked invalid redirect.", { status: 403 });
+      }
+    }
   }
 
   const resHeaders = new Headers(upstreamRes.headers);
@@ -143,18 +112,50 @@ async function handleProxiedFrame(request, url) {
   resHeaders.delete("Content-Security-Policy-Report-Only");
   resHeaders.delete("X-Frame-Options");
   resHeaders.delete("Frame-Options");
+  resHeaders.set("Access-Control-Allow-Origin", "*");
 
   const contentType = upstreamRes.headers.get("Content-Type") || "";
   if (contentType.includes("text/html")) {
     let html = await upstreamRes.text();
-    const baseHref = `<base href="${parsedTarget.toString().replace(/"/g, "&quot;")}">`;
-    const injectedBlock = buildInjectedFrameScript(AD_PATTERNS);
+    const lockScript = [
+      "<script>",
+      "(function(){",
+      "  const ALLOWED = ['kickmx.com', 'www.kickmx.com'];",
+      "  function allowed(u){",
+      "    try{",
+      "      const parsed = new URL(u, window.location.origin);",
+      "      if(parsed.origin === window.location.origin) return true;",
+      "      return ALLOWED.some(function(h){ return parsed.hostname === h || parsed.hostname.endsWith('.' + h); });",
+      "    }catch(e){ return false; }",
+      "  }",
+      "  document.addEventListener('click', function(e){",
+      "    const a = e.target.closest('a[href]');",
+      "    if(!a) return;",
+      "    if(!allowed(a.href)){",
+      "      e.preventDefault();",
+      "      e.stopImmediatePropagation();",
+      "      return;",
+      "    }",
+      "    try{",
+      "      const parsed = new URL(a.href);",
+      "      if(parsed.origin !== window.location.origin){",
+      "        e.preventDefault();",
+      "        window.location.href = parsed.pathname + parsed.search;",
+      "      }",
+      "    }catch(err){}",
+      "  }, true);",
+      "})();",
+      "</" + "script>"
+    ].join("");
 
-    html = html.replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
+    html = html
+      .replace(/https?:\/\/(?:www\.)?kickmx\.com/gi, "")
+      .replace(/\s+(?:integrity|nonce)=["'][^"']*["']/gi, "");
+
     if (/<head[^>]*>/i.test(html)) {
-      html = html.replace(/<head[^>]*>/i, (m) => m + baseHref + injectedBlock);
+      html = html.replace(/<head[^>]*>/i, (m) => m + lockScript);
     } else {
-      html = baseHref + injectedBlock + html;
+      html = lockScript + html;
     }
 
     resHeaders.delete("Content-Length");
@@ -165,126 +166,11 @@ async function handleProxiedFrame(request, url) {
     });
   }
 
-  if (contentType.includes("javascript") || contentType.includes("application/x-javascript")) {
-    if (isAdRequest(parsedTarget.toString())) {
-      return new Response("// Ad script blocked", {
-        status: 200,
-        headers: { "Content-Type": "application/javascript" }
-      });
-    }
-  }
-
   return new Response(upstreamRes.body, {
     status: upstreamRes.status,
     statusText: upstreamRes.statusText,
     headers: resHeaders
   });
-}
-
-function buildInjectedFrameScript(adPatterns) {
-  const adSelectors = [
-    'iframe[src*="googlesyndication"]',
-    'iframe[src*="doubleclick"]',
-    'iframe[src*="google-analytics"]',
-    'div[id*="google_ads"]',
-    'div[class*="adsbygoogle"]',
-    "ins.adsbygoogle",
-    "[data-ad-slot]",
-    "[data-ad-client]",
-    ".a-div-horizontal",
-    ".a-div-vertical",
-    ".a-div-placeholder",
-    ".a-div-box",
-    '[class*="ad-banner"]',
-    '[id*="ad-banner"]',
-    '[class*="popup-ad"]',
-    '[id*="popup-ad"]'
-  ];
-
-  return [
-    "<style id=\"portal-ad-hide-css\">",
-    adSelectors.join(", ") + " {",
-    "  display: none !important;",
-    "  visibility: hidden !important;",
-    "  opacity: 0 !important;",
-    "  pointer-events: none !important;",
-    "  width: 0 !important;",
-    "  height: 0 !important;",
-    "  overflow: hidden !important;",
-    "}",
-    "</style>",
-    "<script id=\"portal-watcher-ads-js\">",
-    "(function(){",
-    "  const parentOrigin = window.location.origin;",
-    "  const adPatterns = " + JSON.stringify(adPatterns) + ";",
-    "  const adSelectors = " + JSON.stringify(adSelectors) + ";",
-    "  function isAdUrl(u){",
-    "    if(!u) return false;",
-    "    const s = String(u).toLowerCase();",
-    "    return adPatterns.some(function(p){ return s.indexOf(p) !== -1; });",
-    "  }",
-    "  function reportText(val){",
-    "    if(typeof val === 'string' && val.trim()){",
-    "      try{ window.parent.postMessage({ type: 'checkText', text: val }, parentOrigin); }catch(e){}",
-    "    }",
-    "  }",
-    "  const origFetch = window.fetch;",
-    "  if(origFetch){",
-    "    window.fetch = function(input, init){",
-    "      const reqUrl = typeof input === 'string' ? input : (input && input.url) || '';",
-    "      if(isAdUrl(reqUrl)){",
-    "        return Promise.reject(new Error('Ad blocked'));",
-    "      }",
-    "      return origFetch.apply(this, arguments);",
-    "    };",
-    "  }",
-    "  const origOpen = XMLHttpRequest.prototype.open;",
-    "  XMLHttpRequest.prototype.open = function(method, u){",
-    "    if(isAdUrl(u)){",
-    "      this._adBlocked = true;",
-    "      return;",
-    "    }",
-    "    return origOpen.apply(this, arguments);",
-    "  };",
-    "  const origSend = XMLHttpRequest.prototype.send;",
-    "  XMLHttpRequest.prototype.send = function(){",
-    "    if(this._adBlocked) return;",
-    "    return origSend.apply(this, arguments);",
-    "  };",
-    "  function cleanAds(){",
-    "    adSelectors.forEach(function(sel){",
-    "      document.querySelectorAll(sel).forEach(function(el){",
-    "        el.style.setProperty('display', 'none', 'important');",
-    "        try{ el.remove(); }catch(e){}",
-    "      });",
-    "    });",
-    "  }",
-    "  cleanAds();",
-    "  if(document.readyState === 'loading'){",
-    "    document.addEventListener('DOMContentLoaded', cleanAds);",
-    "  }",
-    "  setInterval(cleanAds, 500);",
-    "  const obs = new MutationObserver(cleanAds);",
-    "  if(document.documentElement){",
-    "    obs.observe(document.documentElement, { childList: true, subtree: true });",
-    "  }",
-    "  document.addEventListener('input', function(e){",
-    "    const el = e.target;",
-    "    if(!el) return;",
-    "    if(typeof el.value === 'string') reportText(el.value);",
-    "    else if(el.isContentEditable) reportText(el.textContent || '');",
-    "  }, true);",
-    "  document.addEventListener('paste', function(e){",
-    "    const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';",
-    "    if(pasted) reportText(pasted);",
-    "    const el = e.target;",
-    "    if(el && typeof el.value === 'string'){",
-    "      setTimeout(function(){ reportText(el.value); }, 0);",
-    "    }",
-    "  }, true);",
-    "})();",
-    "</" + "script>"
-  ].join("\n");
 }
 
 function getBiblePortalHTML(clientIp) {
@@ -356,8 +242,6 @@ function getBiblePortalHTML(clientIp) {
     { id: "jude", name: "Jude", chapters: 1 },
     { id: "revelation", name: "Revelation", chapters: 22 }
   ]);
-
-  const frameSrc = `${PROXY_PATH}?u=${encodeURIComponent(EMBED_URL)}`;
 
   return [
     "<!DOCTYPE html>",
@@ -471,7 +355,7 @@ function getBiblePortalHTML(clientIp) {
     '      <div class="warning-card">',
     '        <div class="warning-badge">Warning</div>',
     '        <h2 id="warningTitle">External Content Notice</h2>',
-    "        <p>You are about to load an external embedded resource. Please review and accept the terms and conditions before continuing to the site.</p>",
+    "        <p>You are about to load the allowed external resource. Please review and accept the terms and conditions before continuing.</p>",
     '        <div class="warning-actions">',
     '          <button id="acceptTermsBtn" type="button">I Accept Terms and Conditions</button>',
     '          <button id="cancelWarningBtn" type="button">Back to Bible</button>',
@@ -487,10 +371,9 @@ function getBiblePortalHTML(clientIp) {
     "  </div>",
     '  <script type="module">',
     '    import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";',
-    '    import { getFirestore, doc, getDoc, setDoc, collection, addDoc, getDocs, query, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";',
+    '    import { getFirestore, doc, getDoc, setDoc, collection, getDocs, query, where, serverTimestamp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";',
     "    const FIREBASE_CONFIG = " + JSON.stringify(FIREBASE_CONFIG) + ";",
     "    const CLIENT_IP = " + JSON.stringify(clientIp) + ";",
-    "    const BAD_WORDS = ['nsfw','porn','xxx','hentai','sex','nude','nudes','onlyfans','fetish','gore','slur','rape'];",
     "    let db = null;",
     "    try {",
     "      const app = initializeApp(FIREBASE_CONFIG);",
@@ -505,8 +388,6 @@ function getBiblePortalHTML(clientIp) {
     '    const namePromptForm = document.getElementById("namePromptForm");',
     '    const portalNameInput = document.getElementById("portalNameInput");',
     '    const portalNameErr = document.getElementById("portalNameErr");',
-    "    let currentUserName = '';",
-    "    let lastLoggedSignature = '';",
     "    function showBanScreen() {",
     "      targetFrame.classList.remove('active');",
     "      targetFrame.src = '';",
@@ -524,44 +405,6 @@ function getBiblePortalHTML(clientIp) {
     "        return !qSnap.empty;",
     "      } catch { return false; }",
     "    }",
-    "    async function banCurrentIp(reasonWord, typedQuery) {",
-    "      showBanScreen();",
-    "      if (!db || !CLIENT_IP || CLIENT_IP === 'unknown') return;",
-    "      const sig = reasonWord + '::' + typedQuery.toLowerCase();",
-    "      if (sig === lastLoggedSignature) return;",
-    "      lastLoggedSignature = sig;",
-    "      try {",
-    "        await addDoc(collection(db, 'flagged_searches'), {",
-    "          ip: CLIENT_IP,",
-    "          name: currentUserName || 'unknown',",
-    "          query: typedQuery,",
-    "          matchedWord: reasonWord,",
-    "          createdAt: serverTimestamp()",
-    "        });",
-    "        await setDoc(doc(db, 'banned_users', encodeURIComponent(CLIENT_IP)), {",
-    "          ip: CLIENT_IP,",
-    "          name: currentUserName || 'unknown',",
-    "          reason: 'Inappropriate search: ' + reasonWord,",
-    "          bannedAt: serverTimestamp()",
-    "        }, { merge: true });",
-    "      } catch {}",
-    "    }",
-    "    async function inspectTextForViolation(rawText) {",
-    "      const clean = (rawText || '').trim();",
-    "      if (!clean) return;",
-    "      const lower = clean.toLowerCase();",
-    "      const matched = BAD_WORDS.find(function(w) { return lower.includes(w); });",
-    "      if (matched) {",
-    "        await banCurrentIp(matched, clean);",
-    "      }",
-    "    }",
-    "    window.addEventListener('message', function(event) {",
-    "      if (event.origin !== window.location.origin) return;",
-    "      const data = event.data;",
-    "      if (data && data.type === 'checkText' && typeof data.text === 'string') {",
-    "        inspectTextForViolation(data.text);",
-    "      }",
-    "    });",
     "    window.handleLuke54Trigger = async function() {",
     "      readerView.classList.add('hidden');",
     "      portalView.classList.add('active');",
@@ -577,7 +420,6 @@ function getBiblePortalHTML(clientIp) {
     "        try {",
     "          const userSnap = await getDoc(doc(db, 'users', encodeURIComponent(CLIENT_IP)));",
     "          if (userSnap.exists() && userSnap.data().name) {",
-    "            currentUserName = userSnap.data().name;",
     "            warningScreen.classList.add('active');",
     "            return;",
     "          }",
@@ -589,12 +431,6 @@ function getBiblePortalHTML(clientIp) {
     "      e.preventDefault();",
     "      const cleanName = portalNameInput.value.trim();",
     "      if (!cleanName) return;",
-    "      const lowerName = cleanName.toLowerCase();",
-    "      const badName = BAD_WORDS.find(function(w) { return lowerName.includes(w); });",
-    "      if (badName) {",
-    "        await banCurrentIp(badName, cleanName);",
-    "        return;",
-    "      }",
     "      if (db && CLIENT_IP && CLIENT_IP !== 'unknown') {",
     "        portalNameErr.textContent = 'Saving...';",
     "        try {",
@@ -605,28 +441,10 @@ function getBiblePortalHTML(clientIp) {
     "          }, { merge: true });",
     "        } catch {}",
     "      }",
-    "      currentUserName = cleanName;",
     "      portalNameErr.textContent = '';",
     "      namePromptBox.classList.remove('active');",
     "      warningScreen.classList.add('active');",
     "    });",
-    "    document.addEventListener('input', function(e) {",
-    "      const el = e.target;",
-    "      if (!el) return;",
-    "      if (typeof el.value === 'string') {",
-    "        inspectTextForViolation(el.value);",
-    "      } else if (el.isContentEditable) {",
-    "        inspectTextForViolation(el.textContent || '');",
-    "      }",
-    "    }, true);",
-    "    document.addEventListener('paste', function(e) {",
-    "      const pasted = e.clipboardData ? e.clipboardData.getData('text') : '';",
-    "      if (pasted) inspectTextForViolation(pasted);",
-    "      const el = e.target;",
-    "      if (el && typeof el.value === 'string') {",
-    "        setTimeout(function() { inspectTextForViolation(el.value); }, 0);",
-    "      }",
-    "    }, true);",
     "    (async function() {",
     "      if (await isIpBanned(CLIENT_IP)) {",
     "        showBanScreen();",
@@ -635,7 +453,7 @@ function getBiblePortalHTML(clientIp) {
     "  </" + "script>",
     "  <script>",
     "    (function() {",
-    "      const FRAME_SRC = " + JSON.stringify(frameSrc) + ";",
+    "      const PORTAL_ENTRY = " + JSON.stringify(PORTAL_ENTRY) + ";",
     '      const START_BOOK = "genesis";',
     "      const START_CHAPTER = 1;",
     "      const BOOKS = " + booksJson + ";",
@@ -668,7 +486,7 @@ function getBiblePortalHTML(clientIp) {
     '        warningScreen.classList.remove("active");',
     '        namePromptBox.classList.remove("active");',
     '        targetFrame.classList.add("active");',
-    "        targetFrame.src = FRAME_SRC;",
+    "        targetFrame.src = PORTAL_ENTRY;",
     "      }",
     "      function closePortal() {",
     '        targetFrame.classList.remove("active");',
@@ -759,7 +577,7 @@ function getBiblePortalHTML(clientIp) {
     '      nameCancelBtn.addEventListener("click", closePortal);',
     '      bibleBtn.addEventListener("click", closePortal);',
     '      reloadBtn.addEventListener("click", function() {',
-    '        if (targetFrame.classList.contains("active")) targetFrame.src = FRAME_SRC;',
+    '        if (targetFrame.classList.contains("active")) targetFrame.src = PORTAL_ENTRY;',
     "      });",
     '      fullscreenBtn.addEventListener("click", async function() {',
     "        try {",
