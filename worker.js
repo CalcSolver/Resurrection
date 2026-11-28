@@ -8,11 +8,6 @@ const TARGETS = {
     label: "LarpGPT",
     origin: "https://larpgpt.com",
     hosts: ["larpgpt.com", "www.larpgpt.com"]
-  },
-  tiktok: {
-    label: "TikTok",
-    origin: "https://www.tiktok.com",
-    hosts: ["tiktok.com", "www.tiktok.com", "m.tiktok.com"]
   }
 };
 
@@ -45,6 +40,16 @@ function isAllowedHost(hostname) {
 
 function getTargetConfig(key) {
   return TARGETS[key] || TARGETS[DEFAULT_TARGET_KEY];
+}
+
+function detectTargetFromReferer(request) {
+  const ref = request.headers.get("Referer") || "";
+  try {
+    const refUrl = new URL(ref);
+    const match = refUrl.pathname.match(/^\/go\/([^/]+)/);
+    if (match && TARGETS[match[1]]) return match[1];
+  } catch {}
+  return null;
 }
 
 function toProxyUrl(targetKey, rawUrl, currentTargetUrl) {
@@ -100,19 +105,25 @@ export default {
     }
 
     if (url.pathname === PROXY_PREFIX || url.pathname.startsWith(PROXY_PREFIX + "/")) {
-      return handleLockedProxy(request, url);
+      const remainder = url.pathname.slice(PROXY_PREFIX.length).replace(/^\/+/, "");
+      const slashIdx = remainder.indexOf("/");
+      const targetKey = slashIdx === -1 ? remainder || DEFAULT_TARGET_KEY : remainder.slice(0, slashIdx);
+      const subPath = slashIdx === -1 ? "/" : remainder.slice(slashIdx);
+      return handleLockedProxy(request, url, targetKey, subPath);
+    }
+
+    // If an SPA inside /go/<target>/ pushes or requests a sub-route without /go/<target>/,
+    // infer the target from Referer so it doesn't 404.
+    const inferredTarget = detectTargetFromReferer(request);
+    if (inferredTarget) {
+      return handleLockedProxy(request, url, inferredTarget, url.pathname);
     }
 
     return new Response("Not found", { status: 404 });
   }
 };
 
-async function handleLockedProxy(request, url) {
-  const remainder = url.pathname.slice(PROXY_PREFIX.length).replace(/^\/+/, "");
-  const slashIdx = remainder.indexOf("/");
-  const targetKey = slashIdx === -1 ? remainder || DEFAULT_TARGET_KEY : remainder.slice(0, slashIdx);
-  const subPath = slashIdx === -1 ? "/" : remainder.slice(slashIdx);
-
+async function handleLockedProxy(request, url, targetKey, subPath) {
   if (!TARGETS[targetKey]) {
     return new Response("Blocked: Unknown portal target.", {
       status: 403,
@@ -122,12 +133,11 @@ async function handleLockedProxy(request, url) {
 
   const targetCfg = getTargetConfig(targetKey);
   const baseUrl = new URL(targetCfg.origin);
+  const cleanSubPath = subPath.startsWith("/") ? subPath : "/" + subPath;
   const joinedPath =
     baseUrl.pathname && baseUrl.pathname !== "/"
-      ? baseUrl.pathname.replace(/\/+$/, "") + (subPath.startsWith("/") ? subPath : "/" + subPath)
-      : subPath.startsWith("/")
-      ? subPath
-      : "/" + subPath;
+      ? baseUrl.pathname.replace(/\/+$/, "") + cleanSubPath
+      : cleanSubPath;
 
   let targetUrl;
   try {
@@ -232,6 +242,20 @@ async function handleLockedProxy(request, url) {
       "      return null;",
       "    }catch(e){ return u; }",
       "  }",
+      "  function prefixRoute(r){",
+      "    if(typeof r !== 'string') return r;",
+      "    if(r.startsWith(ROUTE_PREFIX)) return r;",
+      "    if(r.startsWith('/')) return ROUTE_PREFIX + r;",
+      "    return r;",
+      "  }",
+      "  const origPushState = history.pushState;",
+      "  history.pushState = function(state, title, url){",
+      "    return origPushState.call(this, state, title, prefixRoute(url));",
+      "  };",
+      "  const origReplaceState = history.replaceState;",
+      "  history.replaceState = function(state, title, url){",
+      "    return origReplaceState.call(this, state, title, prefixRoute(url));",
+      "  };",
       "  const origFetch = window.fetch;",
       "  if(origFetch){",
       "    window.fetch = function(input, init){",
