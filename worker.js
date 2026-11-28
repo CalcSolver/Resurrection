@@ -6,8 +6,8 @@ const TARGETS = {
   },
   larpgpt: {
     label: "LarpGPT",
-    origin: "https://larpgpt.com/",
-    hosts: ["larpgpt", "www.larpgpt", "larpgpt.com", "www.websim.com"]
+    origin: "https://larpgpt.com",
+    hosts: ["larpgpt.com", "www.larpgpt.com"]
   },
   tiktok: {
     label: "TikTok",
@@ -74,7 +74,6 @@ export default {
 };
 
 async function handleLockedProxy(request, url) {
-  // Expected format: /go/<targetKey>/<subpath...>
   const remainder = url.pathname.slice(PROXY_PREFIX.length).replace(/^\/+/, "");
   const slashIdx = remainder.indexOf("/");
   const targetKey = slashIdx === -1 ? remainder || DEFAULT_TARGET_KEY : remainder.slice(0, slashIdx);
