@@ -12,7 +12,17 @@ const TARGETS = {
   more: {
     label: "More",
     origin: "",
-    hosts: [],
+    hosts: [
+      "puzzio.io",
+      "www.puzzio.io",
+      "play.puzzio.io",
+      "games.puzzio.io",
+      "cdn.puzzio.io",
+      "html5.gamedistribution.com",
+      "game-cdn.poki.com",
+      "gamemonetize.com",
+      "html5.gamemonetize.com"
+    ],
     dynamicFromFirestore: true
   }
 };
@@ -36,7 +46,7 @@ function getStaticAllowedHosts() {
   Object.values(TARGETS).forEach((t) => {
     (t.hosts || []).forEach((h) => list.push(h.toLowerCase()));
   });
-  return list;
+  return [...new Set(list)];
 }
 
 const STATIC_ALLOWED_HOSTS = getStaticAllowedHosts();
@@ -65,13 +75,17 @@ function isHostInList(hostname, hostList) {
 
 function buildAllowedHostsForTarget(targetKey, customUrlObj) {
   const list = [...STATIC_ALLOWED_HOSTS];
-  if (targetKey === "more" && customUrlObj && customUrlObj.hostname) {
-    const h = customUrlObj.hostname.toLowerCase();
-    list.push(h);
-    if (h.startsWith("www.")) {
-      list.push(h.slice(4));
+  const candidate = customUrlObj && customUrlObj.hostname ? customUrlObj.hostname.toLowerCase() : "";
+  if (candidate) {
+    list.push(candidate);
+    if (candidate.startsWith("www.")) {
+      list.push(candidate.slice(4));
     } else {
-      list.push("www." + h);
+      list.push("www." + candidate);
+    }
+    const parts = candidate.split(".");
+    if (parts.length >= 2) {
+      list.push(parts.slice(-2).join("."));
     }
   }
   return [...new Set(list)];
@@ -139,7 +153,7 @@ function toProxyUrl(targetKey, rawUrl, currentTargetUrl, allowedHosts) {
 
 function rewriteHtmlAttributes(html, targetKey, currentTargetUrl, allowedHosts) {
   return html.replace(
-    /(\s(?:href|src|action)=)(["'])([^"']*)(\2)/gi,
+    /(\s(?:href|src|action|data-src)=)(["'])([^"']*)(\2)/gi,
     (match, prefix, quote, val, endQuote) => {
       const proxied = toProxyUrl(targetKey, val, currentTargetUrl, allowedHosts);
       return `${prefix}${quote}${proxied}${endQuote}`;
@@ -329,6 +343,14 @@ async function handleLockedProxy(request, url, targetKey, subPath) {
       "  const origReplaceState = history.replaceState;",
       "  history.replaceState = function(state, title, url){",
       "    return origReplaceState.call(this, state, title, prefixRoute(url));",
+      "  };",
+      "  const origSetAttribute = Element.prototype.setAttribute;",
+      "  Element.prototype.setAttribute = function(name, value){",
+      "    if(String(name).toLowerCase() === 'src' || String(name).toLowerCase() === 'href'){",
+      "      const mapped = mapUrl(value);",
+      "      if(mapped) return origSetAttribute.call(this, name, mapped);",
+      "    }",
+      "    return origSetAttribute.apply(this, arguments);",
       "  };",
       "  const origFetch = window.fetch;",
       "  if(origFetch){",
@@ -596,7 +618,7 @@ function getBiblePortalHTML(clientIp) {
     "        </div>",
     "      </div>",
     "    </div>",
-    '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
+    '    <iframe id="targetFrame" src="" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-pointer-lock" allow="accelerometer; camera; encrypted-media; geolocation; gyroscope; hid; microphone; midi; clipboard-read; clipboard-write; xr-spatial-tracking; gamepad; fullscreen" allowfullscreen></iframe>',
     '    <div id="dock">',
     '      <select id="targetSelect" aria-label="Portal Destination"></select>',
     '      <button id="bibleBtn" class="dock-btn" type="button">Bible</button>',
